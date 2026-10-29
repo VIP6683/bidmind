@@ -1,0 +1,102 @@
+/* ===== 全局主题「标析智策」：经典蓝 × 冷灰白 =====
+   专业后台风格：白色侧栏 + 蓝色主色 + 浅灰内容区，
+   圆角卡片、克制阴影。 */
+
+:root {
+  /* 中性色 */
+  --bg: #f5f7fa;            /* 内容区冷灰白 */
+  --bg-deep: #eef1f6;
+  --card: #ffffff;
+  --ink: #1f2329;           /* 主文本 */
+  --ink-2: #4b5260;
+  --text: #2f353f;
+  --muted: #8a94a6;
+
+  /* 主色：经典蓝 */
+  --primary: #0b57d0;
+  --primary-hover: #0a4fbc;
+  --primary-deep: #083a8c;
+  --primary-light: #e8f0fe; /* 浅蓝底（选中态） */
+  --primary-soft: #e8f0fe;
+
+  /* 状态色 */
+  --success: #16a34a;
+  --warning: #e6a23c;
+  --jade: #16a34a;
+  --danger: #e64c3c;
+  --seal: #e64c3c;          /* 风险红（废标级） */
+  --seal-soft: #fdeeea;
+
+  /* 线框 */
+  --border: #e4e8ef;
+  --border-strong: #d3d9e3;
+
+  /* Element Plus 主色覆盖 */
+  --el-color-primary: #0b57d0;
+  --el-color-primary-light-3: #4d83e2;
+  --el-color-primary-light-5: #85abec;
+  --el-color-primary-light-7: #bdd3f5;
+  --el-color-primary-light-8: #d5e2f8;
+  --el-color-primary-light-9: #ecf2fe;
+  --el-color-primary-dark-2: #0946a6;
+  --el-color-success: #67c23a;
+  --el-color-warning: #e6a23c;
+  --el-color-danger: #f56c6c;
+  --el-color-error: #f56c6c;
+  --el-border-radius-base: 8px;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #app { height: 100%; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', 'Helvetica Neue', sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: var(--primary); text-decoration: none; }
+
+/* ===== 白卡片面版 ===== */
+.panel {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px 22px;
+  position: relative;
+}
+
+.panel-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--bg-deep);
+}
+
+.text-muted { color: var(--muted); font-size: 12px; }
+.text-light { color: rgba(255, 255, 255, 0.6); }
+
+.page-title {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+/* 滚动条 */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-thumb { background: #c9d2e0; border-radius: 3px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* Element Plus 细节统一 */
+.el-button { border-radius: 8px; }
+.el-table { --el-table-header-bg-color: #f7f9fc; --el-table-border-color: var(--border); }
+.el-table th.el-table__cell { color: var(--ink-2); font-weight: 600; }
+.el-dialog { border-radius: 12px; }
+.el-card { border-radius: 12px; }
