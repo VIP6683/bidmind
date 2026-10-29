@@ -2,13 +2,6 @@
 defineProps({
 	stats: { type: Object, default: null }
 });
-
-function riskLevel(ratio) {
-	if (!ratio && ratio !== 0) return '—';
-	if (ratio >= 30) return '高';
-	if (ratio >= 10) return '中';
-	return '低';
-}
 </script>
 
 <template>
@@ -26,151 +19,56 @@ function riskLevel(ratio) {
 				>
 			</router-link>
 		</div>
-
-		<div class="hero-right">
-			<div class="ring top">
-				<el-progress
-					type="dashboard"
-					:percentage="stats?.pass_ratio ?? 0"
-					:width="92"
-					:stroke-width="8"
-					color="#8ab6f9"
-				>
-					<template #default>
-						<div class="ring-num">{{ stats?.pass_ratio ?? 0 }}%</div>
-						<div class="ring-label">关键条款</div>
-					</template>
-				</el-progress>
-			</div>
-			<div class="ring-row">
-				<div class="ring-item">
-					<el-progress
-						type="dashboard"
-						:percentage="stats?.critical_ratio ?? 0"
-						:width="76"
-						:stroke-width="8"
-						color="#f56c6c"
-					>
-						<template #default>
-							<div class="ring-num sm">{{ riskLevel(stats?.critical_ratio) }}</div>
-							<div class="ring-label">风险评级</div>
-						</template>
-					</el-progress>
-				</div>
-				<div class="hero-center">
-					<div class="pulse">
-						<el-icon :size="26" color="#fff"><DataAnalysis /></el-icon>
-					</div>
-				</div>
-				<div class="ring-item">
-					<el-progress
-						type="dashboard"
-						:percentage="stats?.critical_ratio ?? 0"
-						:width="76"
-						:stroke-width="8"
-						color="#f89898"
-					>
-						<template #default>
-							<div class="ring-num sm">{{ stats?.critical_ratio ?? 0 }}%</div>
-							<div class="ring-label">废标占比</div>
-						</template>
-					</el-progress>
-				</div>
-			</div>
-			<div class="hero-tip text-light">* 支持本地化、可定制、数据全程本地处理</div>
-		</div>
 	</div>
 </template>
 
 <style scoped>
 .hero {
+	position: relative;
 	border-radius: 14px;
+	border: 1px solid #eef0f4;
 	background:
-		radial-gradient(900px 420px at 85% 120%, rgba(255, 255, 255, 0.1), transparent 60%),
-		linear-gradient(150deg, #0a4fbc 0%, #0b57d0 50%, #1d6feb 100%);
-	color: #fff;
-	padding: 32px 40px;
-	display: flex;
-	justify-content: space-between;
-	align-items: center;
-	gap: 24px;
+		radial-gradient(900px 420px at 88% -20%, #e8f0fd 0%, transparent 55%),
+		radial-gradient(700px 380px at -10% 120%, #eef0fb 0%, transparent 50%),
+		linear-gradient(150deg, #fafbfd 0%, #f2f5fa 100%);
+	color: #1f2329;
+	padding: 34px 40px;
 	overflow: hidden;
 }
+.hero::before {
+	content: '';
+	position: absolute;
+	inset: 0;
+	background-image: radial-gradient(rgba(31, 56, 88, 0.05) 1px, transparent 1px);
+	background-size: 22px 22px;
+	pointer-events: none;
+}
 
+.hero-left {
+	position: relative;
+	z-index: 1;
+}
 .hero-tag {
 	font-size: 12px;
-	opacity: 0.8;
+	color: #8a9099;
 	letter-spacing: 2px;
 	margin-bottom: 14px;
 }
 .hero-title {
-	font-size: 34px;
+	font-size: 30px;
 	font-weight: 700;
 	line-height: 1.35;
 	margin-bottom: 14px;
+	color: #1f2329;
 }
 .hero-desc {
 	font-size: 13px;
-	opacity: 0.85;
-	max-width: 460px;
+	color: #8a9099;
+	max-width: 520px;
 	line-height: 1.8;
 	margin-bottom: 22px;
 }
 .hero-btn {
-	background: rgba(255, 255, 255, 0.14);
-	border: 1px solid rgba(255, 255, 255, 0.5);
-}
-.hero-btn:hover {
-	background: rgba(255, 255, 255, 0.24);
-}
-
-.hero-right {
-	flex-shrink: 0;
-	display: flex;
-	flex-direction: column;
-	align-items: center;
-	gap: 4px;
-}
-.ring-row {
-	display: flex;
-	align-items: center;
-	gap: 8px;
-}
-.ring-num {
-	font-size: 18px;
-	font-weight: 700;
-	color: #fff;
-}
-.ring-num.sm {
-	font-size: 15px;
-}
-.ring-label {
-	font-size: 11px;
-	color: rgba(255, 255, 255, 0.75);
-}
-
-.hero-center {
-	width: 56px;
-	height: 56px;
-	border-radius: 50%;
-	background: radial-gradient(circle at 35% 35%, #6aa5f3, #0b57d0);
-	box-shadow:
-		0 0 0 8px rgba(255, 255, 255, 0.08),
-		0 0 24px rgba(138, 182, 249, 0.7);
-	display: flex;
-	align-items: center;
-	justify-content: center;
-}
-
-.hero-tip {
-	font-size: 11px;
-	color: rgba(255, 255, 255, 0.6);
-	margin-top: 6px;
-}
-
-@media (max-width: 900px) {
-	.hero-right {
-		display: none;
-	}
+	box-shadow: 0 8px 20px rgba(51, 112, 255, 0.28);
 }
 </style>
