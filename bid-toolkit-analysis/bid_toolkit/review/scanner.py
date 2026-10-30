@@ -194,6 +194,31 @@ def _extract_text_file(path):
 
 # ========== Layer 1: 判词扫描 ==========
 
+_CTX_SNAP_CHARS = '。；;！？'
+
+
+def _clip_context(line: str, pos: int, kw_len: int, window: int = 50, max_len: int = 170) -> str:
+    """取命中词前后窗口并尽量对齐到条款边界（。；等），避免截在半句话上。
+
+    单条款超长无边界时回退为固定窗口截取。
+    """
+    start = max(0, pos - window)
+    end = min(len(line), pos + kw_len + window)
+    # 起点向后对齐到最近的条款分隔符之后
+    for i in range(pos - 1, start - 1, -1):
+        if line[i] in _CTX_SNAP_CHARS:
+            start = i + 1
+            break
+    # 终点向前对齐到最近的条款分隔符（含分隔符本身）
+    for i in range(pos + kw_len, min(len(line), end + window)):
+        if line[i] in _CTX_SNAP_CHARS:
+            end = i + 1
+            break
+    if end - start > max_len:
+        start, end = max(0, pos - window), min(len(line), pos + kw_len + window)
+    return ('...' if start > 0 else '') + line[start:end] + ('...' if end < len(line) else '')
+
+
 def _scan_literal(lines, keywords, category_id):
     """精确匹配扫描"""
     hits = []
@@ -202,10 +227,7 @@ def _scan_literal(lines, keywords, category_id):
         page = entry['page']
         for kw in keywords:
             if kw in line:
-                pos = line.index(kw)
-                start = max(0, pos - 50)
-                end = min(len(line), pos + len(kw) + 50)
-                context = ('...' if start > 0 else '') + line[start:end] + ('...' if end < len(line) else '')
+                context = _clip_context(line, line.index(kw), len(kw))
                 hits.append(ScanHit(
                     category=category_id,
                     keyword=kw,
@@ -228,9 +250,7 @@ def _scan_regex(lines, patterns, category_id):
                 m = re.search(pat, line)
                 if m:
                     matched = m.group()
-                    start = max(0, m.start() - 50)
-                    end = min(len(line), m.end() + 50)
-                    context = ('...' if start > 0 else '') + line[start:end] + ('...' if end < len(line) else '')
+                    context = _clip_context(line, m.start(), m.end() - m.start())
                     hits.append(ScanHit(
                         category=category_id,
                         keyword=matched,
@@ -268,9 +288,7 @@ def _scan_emphasis(lines, marks, min_occurrences=3):
             if m in line:
                 pos = line.index(m)
                 if pos < 10:  # 行首附近
-                    start = max(0, pos - 30)
-                    end = min(len(line), pos + len(m) + 80)
-                    context = ('...' if start > 0 else '') + line[start:end] + ('...' if end < len(line) else '')
+                    context = _clip_context(line, max(0, pos - 20), len(m) + 50, window=30)
                     hits.append(ScanHit(
                         category='emphasis_marks',
                         keyword=f'{m} 标识参数',

@@ -24,14 +24,17 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 # ─── 挂载 bid-toolkit 代码路径 ───────────────────────────────
-REPO = Path(r"c:\Users\SJKJ\Documents\trae_projects\test\bid-toolkit-analysis")
+REPO = Path(r"d:\liyu\bidmind\bidmind\bid-toolkit-analysis")
 sys.path.insert(0, str(REPO / "scripts"))
 sys.path.insert(0, str(REPO))
+
+from bid_generator import COMMERCIAL_KEYWORDS  # noqa: E402  # 大纲对齐判定商务标用
 
 OUTPUT_DIR = REPO / "demo_output" / "web"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 CONFIG_PATH = REPO / "templates" / "user_config.yaml"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"  # 固定使用 DeepSeek API 地址
 COMPANY_DIR = REPO / "demo_output" / "company_profile"
 COMPANY_FILES = ("company_info", "qualifications", "team", "performance")
 
@@ -291,8 +294,27 @@ def _clean_qual_item(q):
     return {"requirement": req, "type": typ, "certificate": cert}
 
 
-def slim_points(result: dict) -> dict:
-    """提炼前端展示用的招标要点。"""
+def _norm_score_cat(cat: str) -> str:
+    """评分类别归一化：价格/技术/商务/资信 四大类，竞品对齐。"""
+    c = str(cat or "")
+    if "价格" in c or "报价" in c:
+        return "价格分"
+    if "技术" in c:
+        return "技术分"
+    if "商务" in c or "服务" in c:
+        return "商务分"
+    if "资信" in c or "业绩" in c or "信用" in c or "企业" in c:
+        return "资信分"
+    return c.strip() or "未分类"
+
+
+def slim_points(result: dict, fusion: dict | None = None) -> dict:
+    """提炼前端展示用的招标要点。
+
+    fusion: 评分项双通道融合结果（scoring_fusion.extract_scoring_fusion）。
+    提供时评分项/总分以融合结果为准（总分恒由程序计算，LLM 无权干预）。
+    """
+    src_items = (fusion or {}).get("items") or result.get("scoring_items", [])
     scoring = [
         {
             "类别": s.get("category", ""),
@@ -300,7 +322,7 @@ def slim_points(result: dict) -> dict:
             "分值": s.get("score", ""),
             "评审标准": (s.get("criteria", "") or "")[:200],
         }
-        for s in result.get("scoring_items", [])
+        for s in src_items
         if s.get("item")
     ]
     quals = []
@@ -308,7 +330,7 @@ def slim_points(result: dict) -> dict:
         item = _clean_qual_item(q)
         if item:
             quals.append(item)
-    return {
+    points = {
         "文件名": result.get("文件名", ""),
         "废标红线": result.get("废标红线", []),
         "文件清单": result.get("文件清单", []),
@@ -319,6 +341,26 @@ def slim_points(result: dict) -> dict:
         "时间节点": result.get("时间节点", []),
         "保证金": result.get("保证金", ""),
     }
+    if fusion:
+        points["评分校验"] = {
+            "声明总分": fusion.get("declared_total"),
+            "校验": fusion.get("total_check"),      # pass / fail / unknown
+            "提取通道": fusion.get("channel"),       # rule / llm / fused
+            "需人工复核": fusion.get("needs_review"),
+            "冲突数": len(fusion.get("conflicts") or []),
+            "数据来源": fusion.get("source_section", ""),
+        }
+    # 分类小计（竞品对齐："技术标评分项分值合计：78分"）
+    cat_sum: dict[str, float] = {}
+    for s in scoring:
+        try:
+            v = float(s["分值"])
+        except (TypeError, ValueError):
+            continue
+        label = _norm_score_cat(s.get("类别", ""))
+        cat_sum[label] = round(cat_sum.get(label, 0) + v, 2)
+    points["评分分类汇总"] = cat_sum
+    return points
 
 
 def _risk_summary(items: list[dict]) -> tuple[int, int]:
@@ -332,8 +374,32 @@ def _do_parse(sid: str) -> dict:
     parse_bid = _load_parse_bid()
     sess = SESSIONS[sid]
     md_path = normalize_to_md(sess["src"], sess)
-    result = parse_bid.parse_bid_document(str(md_path))
-    points = slim_points(result)
+    # docx 原件走结构化表格通道（评分5列表/合并单元格依赖此通道）
+    extra_tables = None
+    if Path(sess["src"]).suffix.lower() == ".docx":
+        try:
+            extra_tables = parse_bid.extract_tables_from_docx(str(sess["src"]))
+        except Exception as e:
+            print(f"docx表格通道失败（忽略）: {e}", file=sys.stderr)
+    result = parse_bid.parse_bid_document(str(md_path), extra_tables=extra_tables)
+
+    # 评分项双通道融合：规则候选 + LLM 语义校正 + 程序裁决（总分恒等式校验）
+    fusion = None
+    try:
+        import scoring_fusion
+        llm = _get_llm_client()
+        fusion = scoring_fusion.extract_scoring_fusion(
+            str(md_path), result.get("scoring_items", []), llm,
+            # 原始docx传入：表格整表结构化喂LLM（含合并单元格说明）
+            docx_path=str(sess["src"]) if Path(sess["src"]).suffix.lower() == ".docx" else None,
+        )
+        (OUTPUT_DIR / f"{sid}_评分融合.json").write_text(
+            json.dumps(fusion, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as e:
+        print(f"评分融合失败（回退规则通道）: {e}", file=sys.stderr)
+
+    points = slim_points(result, fusion)
     ocr_info = sess.get("ocr_info")
     if ocr_info:
         points["OCR识别"] = {
@@ -402,8 +468,8 @@ def _do_review(sid: str) -> dict:
     report = "\n".join(lines)
     (OUTPUT_DIR / f"{sid}_审标报告.md").write_text(report, encoding="utf-8")
 
-    # 结构化落盘（详情接口直接读取，避免重启后重扫）
-    structured = {"total": len(items), "stats": stats, "items": items[:80]}
+    # 结构化落盘（详情接口直接读取，避免重启后重扫；items 存全量与 total 一致）
+    structured = {"total": len(items), "stats": stats, "items": items}
     (OUTPUT_DIR / f"{sid}_审标.json").write_text(
         json.dumps(structured, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -486,45 +552,161 @@ def _clean_checklist_item(item: str) -> str:
     name = re.sub(r"^[（(]\d+[)）]\s*", "", item)
     name = re.sub(r"^\d+\s*[、.．]\s*", "", name)
     name = re.sub(r"^[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮]", "", name)
+    name = re.sub(r"^第[一二三四五六七八九十百\d]+[项章节篇]\s*", "", name)
     name = re.sub(r"[（(][^)）]*[)）]\s*$", "", name)
     return name.strip()
 
 
-def _align_outline_with_checklist(sections: list[dict], checklist: list) -> tuple[list[dict], list[str]]:
-    """按招标文件「投标文件组成清单」对齐大纲。
+_CN_NUM_PREFIX = re.compile(r"^[一二三四五六七八九十百]+\s*[、.．]\s*")
 
-    清单中要求、但现有类型大纲未覆盖的条目，自动追加为占位章节，
-    使初稿结构跟随每个招标文件自身的格式要求。
-    返回 (对齐后的章节列表, 新增章节名列表)。
+
+def _norm_title(name: str) -> str:
+    """章节名归一化：去序号前缀、空白与尾部括注，用于模糊匹配。"""
+    name = _clean_checklist_item(name)
+    name = _CN_NUM_PREFIX.sub("", name)
+    return re.sub(r"\s+", "", name)
+
+
+def _lcs_substring(a: str, b: str) -> str:
+    """最长公共子串（滚动数组，标题短，开销可忽略）。"""
+    if not a or not b:
+        return ""
+    prev = [0] * (len(b) + 1)
+    best, best_end = 0, 0
+    for ca in a:
+        cur = [0] * (len(b) + 1)
+        for j, cb in enumerate(b, 1):
+            if ca == cb:
+                cur[j] = prev[j - 1] + 1
+                if cur[j] > best:
+                    best, best_end = cur[j], j
+        prev = cur
+    return b[best_end - best:best_end] if best else ""
+
+
+# 仅靠这些泛词命中不算匹配（"说明/情况"这类词各章节名里太常见）
+_GENERIC_TOKENS = {"说明", "情况", "相关", "其他", "有关", "要求", "格式", "文件", "材料"}
+
+
+def _title_match_score(title: str, item: str) -> float:
+    """大纲章节名与清单条目的匹配分（纯字符串统计，不含项目特定词表）。
+
+    信号：最长公共子串 + 2×共有字符 + 包含关系分级加成 + 尾部核心词加成。
+    - 名称几乎相等（差≤2字）：同一份文件，强匹配；
+    - 短名整体包含于长名且短名≥4字（如"投标保证金"⊂"投标保证金交纳证明"）：
+      核心相同，强匹配；
+    - 包含但短名≤3字（如"承诺书"⊂"采购代理服务费支付承诺书"）：
+      大概率是另一份专门文件，降权；
+    - 仅靠泛词（"说明"等）命中的公共子串不计分。
+    """
+    if not title or not item:
+        return 0.0
+    lcs = _lcs_substring(title, item)
+    lcs_score = 0.0 if lcs in _GENERIC_TOKENS else float(len(lcs))
+    score = lcs_score + 2.0 * len(set(title) & set(item))
+    # 尾部核心词加成（如"…业绩"对"…业绩情况表"），放在包含降权之前一并参与惩罚
+    if len(title) >= 2 and title[-2:] in item:
+        score += 2.0
+    if title == item or (title in item or item in title) and abs(len(title) - len(item)) <= 2:
+        score += 10.0
+    elif title in item or item in title:
+        contained = title if title in item else item
+        if len(contained) >= 4:
+            score += 10.0
+        else:
+            score *= 0.4
+    return score
+
+
+# 无匹配时"证照类"章节的挂靠优先级（通用投标常识：营业执照=民事责任能力证明）
+_CERT_KEYWORDS = (("民事责任", 5.0), ("独立承担", 5.0), ("资质", 3.0), ("证明材料", 2.0))
+# 兜底挂靠判定：得分低于阈值的章节挂到附件最多的"技术大项"上
+_MATCH_THRESHOLD = 6.0
+
+
+def _align_outline_with_checklist(
+    sections: list[dict], checklist: list
+) -> tuple[list[dict], list[str]]:
+    """按招标文件「投标文件目录/组成清单」重建大纲。
+
+    目录的条目名称与顺序为最高优先级：默认大纲章节模糊匹配到目录条目后并入
+    （作为其子节内容），目录有而大纲没有的条目补占位，大纲有而目录没有的
+    章节降级挂靠到最接近的条目下，确保产物结构与目录一一对应。
+    返回 (重建后的章节列表, 说明列表)。
     """
     if not checklist:
         return sections, []
-    titles_norm = [re.sub(r"\s+", "", s["title"]) for s in sections]
-    added: list[str] = []
-    for item in checklist:
-        name = _clean_checklist_item(str(item))
-        if not name or len(name) > 30:
+
+    # 1) 清洗目录条目（保持给定顺序）
+    items: list[str] = []
+    for raw in checklist:
+        name = _clean_checklist_item(str(raw))
+        norm = _norm_title(str(raw))
+        if not norm or len(norm) > 30 or name in items:
             continue
-        norm = re.sub(r"\s+", "", name)
-        if not norm:
+        items.append(name)
+
+    # 2) 大纲章节 → 目录条目 最佳匹配（每个章节只归入一个条目）
+    attach: dict[int, list[dict]] = {i: [] for i in range(len(items))}
+    unmatched: list[dict] = []
+    for sec in sections:
+        t = _norm_title(sec["title"])
+        if not t:
             continue
-        if any(norm in t or t in norm for t in titles_norm):
-            continue
-        sections.append({
-            "index": len(sections) + 1,
+        best_i, best_s = -1, 0.0
+        for i, name in enumerate(items):
+            s = _title_match_score(t, _norm_title(name))
+            if s > best_s:
+                best_i, best_s = i, s
+        if best_i >= 0 and best_s >= _MATCH_THRESHOLD:
+            attach[best_i].append(sec)
+        else:
+            unmatched.append(sec)
+
+    # 3) 未匹配章节兜底：证照类按关键词挂靠；其余挂到已并入章节最多的条目（技术大项）
+    notes: list[str] = []
+    for sec in unmatched:
+        t = _norm_title(sec["title"])
+        target = -1
+        if any(k in t for k in ("营业执照", "资质", "许可", "证照")):
+            best_w = 0.0
+            for i, name in enumerate(items):
+                w = sum(weight for kw, weight in _CERT_KEYWORDS if kw in name)
+                if w > best_w:
+                    target, best_w = i, w
+        if target < 0:
+            target = max(attach, key=lambda i: len(attach[i]))
+        attach[target].append(sec)
+        notes.append(f"{sec['title']} → {items[target]}")
+
+    # 4) 按目录顺序重建章节：有并入内容的用并入内容，否则补占位
+    placeholder = "招标文件「投标文件组成」明确要求包含本项，请按招标文件给定格式编制，勿遗漏。"
+    rebuilt: list[dict] = []
+    for i, name in enumerate(items):
+        atts = attach[i]
+        if len(atts) == 1 and _norm_title(atts[0]["title"]) == _norm_title(name):
+            content = atts[0].get("content", "")
+        else:
+            content = "\n\n".join(
+                f"### {a['title']}\n\n{a.get('content', '')}".strip() for a in atts
+            )
+        rebuilt.append({
+            "index": len(rebuilt) + 1,
             "title": name,
-            "content": "招标文件「投标文件组成」明确要求包含本项，请按招标文件给定格式编制，勿遗漏。",
-            "part": "其他",
-            "is_commercial": False,
+            "content": content or placeholder,
+            "part": atts[0]["part"] if atts else "其他",
+            "is_commercial": any(k in name for k in COMMERCIAL_KEYWORDS),
         })
-        titles_norm.append(norm)
-        added.append(name)
-    return sections, added
+    return rebuilt, notes
 
 
 @app.post("/api/generate/{sid}")
-def generate(sid: str):
-    """生成投标文件初稿：已配置 LLM 时逐章节 AI 生成正文，未配置时降级骨架+占位符模式。"""
+def generate(sid: str, use_ai: bool = False):
+    """生成投标文件初稿。
+
+    默认（use_ai=False）仅本地模板骨架模式，不调用 AI；
+    仅当前端显式传入 use_ai=true 且已配置 LLM Key 时，才逐章节 AI 生成正文。
+    """
     sys.path.insert(0, str(REPO / "scripts"))
     from bid_generator import (  # noqa: PLC0415
         load_company_profiles,
@@ -532,7 +714,9 @@ def generate(sid: str):
         parse_outline,
         generate_commercial_section,
         generate_technical_section,
+        inject_company_material,
         detect_bid_type,
+        COMMERCIAL_KEYWORDS,
         TEMPLATES_DIR,
         OUTLINE_FILES,
     )
@@ -560,16 +744,16 @@ def generate(sid: str):
     outline_path = TEMPLATES_DIR / OUTLINE_FILES.get(bid_type, "service_outline.md")
     sections = parse_outline(outline_path)
 
-    # 2.5) 按招标文件「投标文件组成清单」对齐大纲：
-    #      清单要求但大纲未覆盖的条目自动补充为章节，使结构跟随该招标文件的格式要求
+    # 2.5) 按招标文件「投标文件目录/组成清单」重建大纲：
+    #      目录条目的名称与顺序为最终结构，默认大纲章节匹配并入，缺失条目补占位
     checklist = [str(x).strip() for x in (rfp_data.get("文件清单") or []) if str(x).strip()]
     sections, checklist_added = _align_outline_with_checklist(sections, checklist)
 
     # 3) 企业素材（演示用占位素材目录）
     profiles = load_company_profiles(COMPANY_DIR)
 
-    # 4) 组装：商务标模板填充；技术标有 LLM 配置则 AI 生成正文，否则骨架占位
-    llm = _get_llm_client()
+    # 4) 组装：商务标模板填充；技术标仅在 use_ai=True 且已配置 LLM 时 AI 生成正文，否则骨架占位
+    llm = _get_llm_client() if use_ai else None
     llm_ok = 0
     rfp_summary = build_rfp_summary(rfp_data)
     md_parts = [f"# 投标文件（{'AI 初稿' if llm else '初稿骨架'}）：{sess['stem']}\n"]
@@ -582,9 +766,10 @@ def generate(sid: str):
             md_parts.append("\n" + content + "\n")
             llm_ok += int(ok)
         else:
+            inject_company_material(sec, profiles)
             md_parts.append(f"\n## {sec['title']}\n")
             req = sec.get("content", "")
-            md_parts.append(f"> 本节需按评分项响应展开。招标方相关要求摘要：\n>\n{req[:600]}\n")
+            md_parts.append(f"{req}\n")
             md_parts.append("\n（内容待填写：结合企业素材与评分标准逐条响应）\n")
     md_text = "\n".join(md_parts)
     md_out = OUTPUT_DIR / f"{sid}_投标文件初稿.md"
@@ -858,8 +1043,8 @@ def get_llm_config():
     return {
         "api_key": _mask_key(key),
         "has_key": bool(key),
-        "base_url": cfg.get("base_url") or "",
-        "model": cfg.get("model") or "",
+        "base_url": DEEPSEEK_BASE_URL,  # 固定 DeepSeek 地址
+        "model": cfg.get("model") or "deepseek-chat",
         "temperature": cfg.get("temperature", 0.7),
         "max_tokens": cfg.get("max_tokens", 4096),
         "timeout": cfg.get("timeout", 60),
@@ -890,7 +1075,10 @@ def put_llm_config(body: LlmConfigBody):
     for k, v in updates.items():
         if k == "api_key" and "***" in v:
             continue  # 脱敏占位，不回写
+        if k == "base_url":
+            continue  # base_url 固定为 DeepSeek，忽略前端传值
         llm[k] = v
+    llm["base_url"] = DEEPSEEK_BASE_URL  # 强制写死
     full["llm"] = llm
     # safe_dump 会丢注释，页面已提示；不引入 ruamel 保持依赖最小
     CONFIG_PATH.write_text(yaml.safe_dump(full, allow_unicode=True, sort_keys=False), encoding="utf-8")

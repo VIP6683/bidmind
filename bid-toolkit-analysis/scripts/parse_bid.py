@@ -97,6 +97,52 @@ def extract_tables_from_pdf(pdf_path):
     return tables_result
 
 
+def extract_tables_from_docx(docx_path):
+    """从DOCX提取结构化表格数据（python-docx原生表格），输出格式与PDF通道一致。
+
+    v2.6: docx输入此前永远走不了表格结构化通道（tables=[]），
+    导致5列评分表/合并单元格表只能靠md正则弱通道。此函数补齐该缺口。
+    合并单元格：python-docx 对横向合并返回重复文本，保留重复即可
+    （下游 _build_col_map 按列头分类，重复不影响）；纵向合并同理。
+    """
+    tables_result = []
+    try:
+        from docx import Document
+        doc = Document(docx_path)
+        for t_idx, table in enumerate(doc.tables):
+            try:
+                grid = []
+                for row in table.rows:
+                    grid.append([str(cell.text or "").strip().replace("\n", " ") for cell in row.cells])
+                # 过滤空表（<2行或<2列 = 布局噪音）
+                if len(grid) < 2 or len(grid[0]) < 2:
+                    continue
+                cleaned = [row for row in grid if any(cell for cell in row)]
+                if len(cleaned) < 2:
+                    continue
+                # 补齐列数
+                ncol = max(len(r) for r in cleaned)
+                for row in cleaned:
+                    while len(row) < ncol:
+                        row.append("")
+                headers = cleaned[0]
+                rows = cleaned[1:]
+                md = _table_to_markdown(cleaned)
+                tables_result.append({
+                    "page": t_idx + 1,  # docx无页码，用表格序号占位
+                    "headers": headers,
+                    "rows": rows,
+                    "markdown": md,
+                })
+            except Exception as e:
+                print(f"docx表格{t_idx + 1}提取警告：{e}", file=sys.stderr)
+    except ImportError:
+        print("警告：未安装 python-docx，docx表格通道不可用", file=sys.stderr)
+    except Exception as e:
+        print(f"docx表格提取警告：{e}", file=sys.stderr)
+    return tables_result
+
+
 def extract_text_from_pdf(pdf_path, include_tables=True):
     """从PDF提取文本（pdfplumber主路径，PyMuPDF fallback）。
 
@@ -149,7 +195,7 @@ def extract_text_from_pdf(pdf_path, include_tables=True):
 
 
 def read_input_file(file_path):
-    """读取输入文件（PDF或Markdown）"""
+    """读取输入文件（PDF/DOCX/Markdown/TXT）"""
     path = Path(file_path)
     if not path.exists():
         print(f"文件不存在：{file_path}", file=sys.stderr)
@@ -157,12 +203,46 @@ def read_input_file(file_path):
 
     if path.suffix.lower() == '.pdf':
         return extract_text_from_pdf(str(path))
+    elif path.suffix.lower() == '.docx':
+        # python-docx 按文档顺序提取（段落与表格交替内联，评分表出现在
+        # 评标章节原位，供章节切片和文本通道消费）；
+        # 结构化表格由 parse_bid_document 的 docx表格通道单独提供
+        try:
+            from docx import Document
+            from docx.oxml.ns import qn
+            from docx.table import Table
+            from docx.text.paragraph import Paragraph
+            doc = Document(str(path))
+            parts = []
+            for child in doc.element.body.iterchildren():
+                if child.tag == qn('w:p'):
+                    t = (Paragraph(child, doc).text or "").strip()
+                    if t:
+                        parts.append(t)
+                elif child.tag == qn('w:tbl'):
+                    try:
+                        tbl = Table(child, doc)
+                        grid = [
+                            [str(c.text or "").strip().replace("\n", " ") for c in r.cells]
+                            for r in tbl.rows
+                        ]
+                        grid = [row for row in grid if any(cell for cell in row)]
+                        if len(grid) >= 2:
+                            md = _table_to_markdown(grid)
+                            if md:
+                                parts.append(md)
+                    except Exception as e:
+                        print(f"docx表格内联警告：{e}", file=sys.stderr)
+            return "\n".join(parts)
+        except ImportError:
+            print("警告：未安装 python-docx，无法读取docx文本", file=sys.stderr)
+            return ""
     elif path.suffix.lower() in ('.md', '.txt'):
         with open(path, 'r', encoding='utf-8') as f:
             return f.read()
     else:
         print(f"不支持的文件格式：{path.suffix}", file=sys.stderr)
-        print("支持：.pdf / .md / .txt", file=sys.stderr)
+        print("支持：.pdf / .docx / .md / .txt", file=sys.stderr)
         sys.exit(1)
 
 
@@ -294,14 +374,25 @@ def extract_document_checklist(text):
     checklist = []
 
     # v2.1: 收窄触发词，去掉"应提交"/"需提交"等过宽匹配
-    section_pattern = r'(?:投标文件应至少包括|投标文件应包括|投标文件由以下|投标文件包含|投标文件应包含|投标文件[组构]成|投标文件应至少包括下列部分)[^\n]*'
+    # v2.2: 增加「投标文件目录」触发（政采云格式常见，条目为中文序号）
+    section_pattern = r'(?:投标文件应至少包括|投标文件应包括|投标文件由以下|投标文件包含|投标文件应包含|投标文件[组构]成|投标文件应至少包括下列部分|投标文件目录)[^\n]*'
     matches = list(re.finditer(section_pattern, text))
 
     for match in matches:
+        # v2.2: 触发行本身须是短标题（或以冒号结尾），避免正文中出现"投标文件组成"字样误触发
+        line_start = text.rfind('\n', 0, match.start()) + 1
+        trigger_line = text[line_start:match.end()].strip()
+        if len(trigger_line) > 30 and not trigger_line.rstrip().endswith(('：', ':')):
+            continue
         start = match.end()
         # v2.0: 扩大上下文窗口到2000字符
         context = text[start:start + 2000]
         lines = context.split('\n')
+
+        # v2.2: 连续非条目行计数——超过3行视为清单结束（替代旧"遇一、即停"逻辑，
+        #        因为中文序号条目本身以"一、二、…"开头，不能作为停止标志）
+        cn_item_re = re.compile(r'^[一二三四五六七八九十百]+[、.．]\s*')
+        misses = 0
 
         for line in lines:
             line = line.strip()
@@ -310,8 +401,8 @@ def extract_document_checklist(text):
             # v2.1: 跳过页码噪音如"18 -" / "19 -" / "- 18 -"
             if re.match(r'^-?\s*\d+\s*[-]?\s*$', line) or re.match(r'^-\s*\d+\s*-', line):
                 continue
-            # v2.0: 遇到下一个大章节标题就停（避免抓到别的章节内容）
-            if re.match(r'^[一二三四五六七八九十]+[、.．]\s', line) and len(line) < 30:
+            # v2.2: 遇到"格式X："/"第X章"等格式正文起点即停
+            if re.match(r'^格式\s*[一二三四五六七八九十\d]', line) or re.match(r'^第[一二三四五六七八九十]+章', line):
                 break
             # v2.1: 匹配（1）/ (1) / 1. / 1、/ ① 等，不要求)后跟分隔符
             if re.match(r'^[（(]\d+[)）]', line) or re.match(r'^\d+\s*[、.．]\s', line) or re.match(r'^[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳]', line):
@@ -323,10 +414,22 @@ def extract_document_checklist(text):
                     item = re.sub(r'第\d+页.*$', '', item).strip()
                     if item and len(item) > 2:
                         checklist.append(item)
+                misses = 0
+            # v2.2: 中文序号条目（一、投标函 / 二十六、履约担保函…）
+            elif cn_item_re.match(line) and len(line) < 40:
+                item = cn_item_re.sub('', line).strip()
+                if item and len(item) > 2:
+                    checklist.append(item)
+                misses = 0
             elif re.match(r'^[-•·●]\s+', line):
                 item = re.sub(r'^[-•·●]\s+', '', line).strip()
                 if item and len(item) > 2:
                     checklist.append(item)
+                misses = 0
+            else:
+                misses += 1
+                if misses >= 3:
+                    break
         # v2.0: 不break，继续找下一个匹配（一份招标文件可能有多个文件清单段落）
 
     # 去重
@@ -399,6 +502,57 @@ def extract_outline(text):
         '类似项目业绩', '技术方案', '商务部分', '资信部分', '价格部分',
         '业绩部分', '团队部分', '服务方案', '实施方案', '售后方案',
     ]
+
+    # v2.1: 散文式评分表支持（编号 + 名称 + 行尾分值，如"（1）价格分  30分"/"2）体系证书（3分）"）
+    _NUM_CN = '一二三四五六七八九十'
+    prose_re = re.compile(
+        r'^(?:(?P<pa>[（(][\d' + _NUM_CN + r']{1,3}[)）])|(?P<pb>\d{1,2}[）).、]))?'
+        r'\s*(?P<name>[^\d（(].{0,28}?)\s*'
+        r'(?:(?P<s1>[（(]\d{1,3}(?:\.\d{1,2})?\s*分[)）])|\s{2,}(?P<s2>\d{1,3}(?:\.\d{1,2})?)\s*分)\s*$'
+    )
+    prose_items = []
+
+    def _num_style(prefix: str) -> str:
+        core = prefix.strip('（）()').strip()
+        if not core:
+            return 'none'
+        if all(ch in _NUM_CN for ch in core):
+            return 'cn'
+        return 'fw' if prefix[0] in '（(' else 'hw'
+
+    def _collapse_prose_items(items):
+        """子项分值和==父项分值时用子项替换父项，避免总分双算。"""
+        if not items:
+            return items
+        outer = items[0]['_style']
+        result, i = [], 0
+        while i < len(items):
+            it = items[i]
+            children, j = [], i + 1
+            while j < len(items) and items[j]['_style'] != outer:
+                children.append(items[j])
+                j += 1
+            if (
+                len(children) >= 2
+                and abs(sum(c['分值'] for c in children) - it['分值']) <= 0.5
+            ):
+                result.extend(children)
+                i = j
+            else:
+                result.append(it)
+                i += 1
+        total = sum(it['分值'] for it in result)
+        if total > 100:
+            # 兜底：保留分值和 ≤100 的最大编号样式层
+            best = None
+            for style in ('fw', 'hw', 'cn', 'none'):
+                grp = [it for it in items if it['_style'] == style]
+                s = sum(it['分值'] for it in grp)
+                if grp and 0 < s <= 100 and (best is None or s > best[1]):
+                    best = (grp, s)
+            if best:
+                return best[0]
+        return result
     
     # 扫描找"XX分"行，向上找评分内容名
     for i, line in enumerate(lines_list):
@@ -406,6 +560,22 @@ def extract_outline(text):
         if not line_s:
             continue
         
+        # v2.1: 散文式分值行优先（"（1）价格分  30分" / "2）体系证书（3分）"）
+        prose_m = prose_re.match(line_s)
+        if prose_m:
+            val_str = prose_m.group('s1') or prose_m.group('s2')
+            if val_str:
+                score_val = float(re.search(r'[\d.]+', val_str).group())
+                if 0 < score_val <= 100:
+                    prefix = prose_m.group('pa') or prose_m.group('pb') or ''
+                    prose_items.append({
+                        "项目": prose_m.group('name').strip().rstrip('：: '),
+                        "分值": int(score_val) if score_val == int(score_val) else score_val,
+                        "评分标准": "",
+                        "_style": _num_style(prefix),
+                    })
+            continue
+
         # 匹配 "15 分" / "10分" / "5 分" 这种独立的分值行
         score_match = re.match(r'^(\d{1,2})\s*分$', line_s)
         if not score_match:
@@ -475,12 +645,27 @@ def extract_outline(text):
                 "评分标准": desc_text
             })
     
-    # 去重（同名的保留第一个）
+    # v2.1: 折叠前先按(项目,分值)去重（概览段与详情段的重复标题行会干扰层级折叠）
+    _dedup_prose: list[dict] = []
+    _seen_prose: set[tuple] = set()
+    for _pit in prose_items:
+        _pk = (_pit["项目"], _pit["分值"])
+        if _pk not in _seen_prose:
+            _seen_prose.add(_pk)
+            _dedup_prose.append(_pit)
+    prose_items = _dedup_prose
+
+    # v2.1: 散文式评分项层级折叠后并入
+    scoring_items.extend(_collapse_prose_items(prose_items))
+
+    # 去重（同项目名且同分值的保留第一个，不同分值的同名子项均保留）
     seen_names = set()
     for item in scoring_items:
-        if item["项目"] not in seen_names:
+        item.pop('_style', None)
+        key = (item["项目"], item["分值"])
+        if key not in seen_names:
             outline["来源_评分项"].append(item)
-            seen_names.add(item["项目"])
+            seen_names.add(key)
     
     # 计算总分
     total_score = sum(item["分值"] for item in outline["来源_评分项"])
@@ -491,17 +676,26 @@ def extract_outline(text):
 
 
 def extract_budget(text):
-    """提取预算金额"""
+    """提取预算金额 v2.0: 保留原始单位（万/万元/元），不再丢失“万”字"""
     budgets = []
     patterns = [
-        r'预算[金额]*[：:]\s*(?:人民币)?\s*([\d,，]+(?:\.\d+)?)\s*(?:万?元)',
-        r'最高[限投]*价[：:]\s*(?:人民币)?\s*([\d,，]+(?:\.\d+)?)\s*(?:万?元)',
-        r'控制价[：:]\s*(?:人民币)?\s*([\d,，]+(?:\.\d+)?)\s*(?:万?元)',
+        # 预算金额： / 预算金额为： / 项目预算为
+        r'预算[金额]*[为是]?[：:]\s*(?:人民币)?\s*([\d,，]+(?:\.\d+)?)\s*(万元|万|元)',
+        # 最高限价（如有）： / 最高投标限价：
+        r'最高(?:\s*投\s*标\s*)?限价(?:\s*[（(][^）)]*[）)])?[：:]\s*(?:人民币)?\s*([\d,，]+(?:\.\d+)?)\s*(万元|万|元)',
+        # 招标控制价：
+        r'(?:招标)?控制价(?:\s*[（(][^）)]*[）)])?[：:]\s*(?:人民币)?\s*([\d,，]+(?:\.\d+)?)\s*(万元|万|元)',
+        # 预算金额为 100万元（无冒号写法）
+        r'预算[金额]*为\s*(?:人民币)?\s*([\d,，]+(?:\.\d+)?)\s*(万元|万|元)',
     ]
     for pattern in patterns:
         match = re.search(pattern, text)
         if match:
-            budgets.append(match.group(1).replace(',', '').replace('，', '') + "元")
+            num = match.group(1).replace(',', '').replace('，', '')
+            unit = match.group(2)
+            if unit == '万':  # “100万”规范为“100万元”
+                unit = '万元'
+            budgets.append(num + unit)
     return budgets
 
 
@@ -624,11 +818,12 @@ def extract_deposit(text):
                 current = val
         return total + section + current
     
-    # 投标保证金 - 先试阿拉伯数字，再试中文数字
-    bid_match = re.search(r'投标保证金[数额金额：:\s]*第?\d*\s*包?[：:]?\s*人民币?\s*(\d+(?:[，,]\d+)?(?:\.\d+)?)\s*万?元', text)
+    # 投标保证金 - 先试阿拉伯数字，再试中文数字（单位捕获保留，万/元不混淆）
+    bid_match = re.search(r'投标保证金[数额金额：:\s]*第?\d*\s*包?[：:]?\s*人民币?\s*(\d+(?:[，,]\d+)?(?:\.\d+)?)\s*(万元|万|元)', text)
     if bid_match:
         amt = bid_match.group(1).replace('，','').replace(',','')
-        deposit['投标保证金'] = amt + '元'
+        unit = bid_match.group(2)
+        deposit['投标保证金'] = amt + ('万元' if unit == '万' else unit)
     else:
         cn_match = re.search(r'投标保证金[数额金额：:\s]*第?\d*\s*包?[：:]?\s*人民币?\s*([壹贰叁肆伍陆柒捌玖拾佰仟万亿圆元整]+)', text)
         if cn_match:
@@ -636,11 +831,12 @@ def extract_deposit(text):
             if val > 0:
                 deposit['投标保证金'] = f'{val}元'
     
-    # 履约保证金
-    perf_match = re.search(r'履约保证金[：:；;收取金额\s]*人民币?\s*(\d+(?:[，,]\d+)?(?:\.\d+)?)\s*万?元', text)
+    # 履约保证金（单位捕获保留，万/元不混淆）
+    perf_match = re.search(r'履约保证金[：:；;收取金额\s]*人民币?\s*(\d+(?:[，,]\d+)?(?:\.\d+)?)\s*(万元|万|元)', text)
     if perf_match:
         amt = perf_match.group(1).replace('，','').replace(',','')
-        deposit['履约保证金'] = amt + '元'
+        unit = perf_match.group(2)
+        deposit['履约保证金'] = amt + ('万元' if unit == '万' else unit)
     else:
         cn_match = re.search(r'履约保证金[：:；;收取金额\s]*人民币?\s*([壹贰叁肆伍陆柒捌玖拾佰仟万亿圆元整]+)', text)
         if cn_match:
@@ -852,6 +1048,15 @@ def extract_scoring_items_from_tables(tables: list[dict]) -> list[dict]:
         if "item" not in col_map or "score" not in col_map:
             continue
 
+        # 严格表头判定：表头精确命中"评分内容/分值"类标准列名 → 该表确为评分表，
+        # 逐行信任分值列，不再套用行业词表过滤（词表会误杀"履约信用/设备配置"等
+        # 不含评分词汇的合法评分行，导致总分缺项）；词表过滤仅用于模糊识别的表格
+        hdrs_norm = {re.sub(r"\s+", "", str(h)) for h in headers if h}
+        strict_headers = (
+            any(h in ITEM_COL_EXACT for h in hdrs_norm)
+            and any(h in SCORE_COL_EXACT for h in hdrs_norm)
+        )
+
         item_idx = col_map["item"]
         score_idx = col_map["score"]
         criteria_idx = col_map.get("criteria", -1)
@@ -863,6 +1068,17 @@ def extract_scoring_items_from_tables(tables: list[dict]) -> list[dict]:
 
         for row in rows:
             if not isinstance(row, (list, tuple)) or len(row) <= max(item_idx, score_idx):
+                continue
+
+            # 合并单元格类目行：整行各列内容完全一致（docx/pdf合并单元格的填充特征，
+            # 如"一、价格30分"×5列）→ 是分类标题不是评分项，跳过防止父子双算。
+            # 纯数字一致行不在此列（可能是合并的分值单元格），保守跳过判定
+            _cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
+            if (
+                len(_cells) >= 2
+                and len(set(_cells)) == 1
+                and not re.fullmatch(r'\d+(?:\.\d+)?', _cells[0])
+            ):
                 continue
 
             raw_item = str(row[item_idx]).strip().replace("\n", " ") if row[item_idx] else ""
@@ -913,11 +1129,12 @@ def extract_scoring_items_from_tables(tables: list[dict]) -> list[dict]:
             if "合计" in item or "总计" in item or "小计" in item:
                 continue
 
-            # v2.5c: 逐item验证 - 去除空格后再匹配评分词和区块名
-            item_nospace = item.replace(" ", "")
+            # v2.5c: 逐item验证 - 去除空格后匹配评分词和区块名（剔除"分钟"避免误命中"分"）
+            # 严格表头表格已确认为评分表，跳过词表过滤，避免丢合法评分行
+            item_nospace = item.replace(" ", "").replace('分钟', '')
             has_item_desc = any(w in item_nospace for w in SCORING_DESC_WORDS)
             has_item_section = any(s in item_nospace for s in SCORING_SECTION_NAMES)
-            if not has_item_desc and not has_item_section:
+            if not strict_headers and not has_item_desc and not has_item_section:
                 continue
 
             table_items.append({
@@ -933,16 +1150,44 @@ def extract_scoring_items_from_tables(tables: list[dict]) -> list[dict]:
         if not table_items:
             continue
 
-        # v2.5c: 表级别验证 - 去除空格后匹配
-        table_has_desc = any(
-            any(w in ti["item"].replace(" ", "") for w in SCORING_DESC_WORDS)
-            or any(s in ti["item"].replace(" ", "") for s in SCORING_SECTION_NAMES)
-            for ti in table_items
-        )
-        if not table_has_desc:
-            continue
+        # v2.5c: 表级别验证 - 去除空格后匹配（严格表头表格跳过，理由同上）
+        if not strict_headers:
+            table_has_desc = any(
+                any(w in ti["item"].replace(" ", "") for w in SCORING_DESC_WORDS)
+                or any(s in ti["item"].replace(" ", "") for s in SCORING_SECTION_NAMES)
+                for ti in table_items
+            )
+            if not table_has_desc:
+                continue
 
         items.extend(table_items)
+
+    # 父类目行兜底折叠：某些文档合并单元格信息丢失后，类目标题行（名称自带分值、
+    # 无实质评审标准）会被当成评分项，与其下子项双算。判定为纯结构特征，与行业
+    # 词汇无关：名称以"N分"结尾且≤20字、criteria为空或与名称相同，且其分值==
+    # 紧随其后到下一个类目行之间的子项分值之和 → 删除父项防双算
+    def _is_agg_row(it: dict) -> bool:
+        name = str(it.get('item', '')).strip()
+        crit = str(it.get('criteria', '') or '').strip()
+        if crit and crit != name:
+            return False
+        return bool(re.search(r'\d{1,3}(?:\.\d{1,2})?\s*分\s*$', name)) and len(name) <= 20
+
+    collapsed: list[dict] = []
+    _i = 0
+    while _i < len(items):
+        it = items[_i]
+        if _is_agg_row(it):
+            _j, _s = _i + 1, 0.0
+            while _j < len(items) and not _is_agg_row(items[_j]):
+                _s += float(items[_j]['score'])
+                _j += 1
+            if _j > _i + 1 and abs(_s - float(it['score'])) <= 0.01:
+                _i += 1
+                continue
+        collapsed.append(it)
+        _i += 1
+    items = collapsed
 
     seen: set[str] = set()
     unique: list[dict] = []
@@ -953,6 +1198,98 @@ def extract_scoring_items_from_tables(tables: list[dict]) -> list[dict]:
             unique.append(it)
 
     return unique
+
+
+_MD_SCORING_ITEM_HEADERS = {'评分内容', '评分因素', '评审内容', '评分项目', '评审项目', '评分要素', '评审因素'}
+_MD_SCORING_SCORE_HEADERS = {'分值', '分数', '得分', '权重', '权值', '满分'}
+_MD_SCORING_CRITERIA_PREFIXES = ('评分标准', '评审标准', '评分细则', '评审细则', '评分依据', '评审依据')
+_MD_SCORING_CAT_HEADERS = {'类别', '类型', '备注'}
+_MD_SCORING_CAT_EXCLUDE = ('客观', '主观')
+
+
+def _guess_scoring_category(context: str) -> str:
+    for cat, keywords in (
+        ('技术分', ('技术', '技术方案', '技术部分', '技术评分', '技术标')),
+        ('商务分', ('商务', '商务部分', '商务评分', '商务方案', '商务标')),
+        ('价格分', ('价格', '报价', '价格部分', '报价部分', '价格评分')),
+        ('资信分', ('资信', '资信部分', '资信评分', '业绩', '业绩部分')),
+    ):
+        if any(kw in context for kw in keywords):
+            return cat
+    return ''
+
+
+def _extract_md_table_scoring(text: str) -> list[dict]:
+    """从文本内嵌 Markdown 表格提取评分项（表头定位列，任意列序）。
+
+    仅当表头同时含"评分内容/评分因素"类列与"分值/分数"类列时才视为评分表。
+    合并单元格类别行（各列内容一致，如"一、价格30分"×5）只作类别提示，
+    不作为评分项，防止与子行双算。
+    """
+    lines = text.split('\n')
+    items: list[dict] = []
+    i, n = 0, len(lines)
+    while i < n:
+        if not lines[i].strip().startswith('|'):
+            i += 1
+            continue
+        block: list[str] = []
+        while i < n and lines[i].strip().startswith('|'):
+            block.append(lines[i].strip())
+            i += 1
+        if len(block) < 3:
+            continue
+        header = [c.strip() for c in block[0].strip().strip('|').split('|')]
+        col_item = col_score = col_criteria = col_cat = -1
+        for ci, h in enumerate(header):
+            hc = re.sub(r'[（(].*?[)）]', '', h).strip()
+            if hc in _MD_SCORING_ITEM_HEADERS:
+                col_item = ci
+            elif hc in _MD_SCORING_SCORE_HEADERS:
+                col_score = ci
+            elif hc.startswith(_MD_SCORING_CRITERIA_PREFIXES):
+                col_criteria = ci
+            elif hc in _MD_SCORING_CAT_HEADERS:
+                col_cat = ci
+        if col_item < 0 or col_score < 0:
+            continue
+        last_cat = ''
+        for row in block[1:]:
+            cells = [c.strip() for c in row.strip().strip('|').split('|')]
+            if len(cells) <= max(col_item, col_score):
+                continue
+            if re.match(r'^[-: ]+$', cells[0]):
+                continue
+            # 合并单元格类别行：各列内容一致 → 记住类别，不计分（防双算）
+            if len(cells) > 1 and len(set(cells)) == 1:
+                m_cat = re.match(r'^[一二三四五六七八九十]+、\s*(.+?)\s*(\d+(?:\.\d+)?)\s*分$', cells[0])
+                if m_cat:
+                    last_cat = m_cat.group(1)
+                continue
+            name = cells[col_item]
+            score_m = re.search(r'\d+(?:\.\d+)?', cells[col_score])
+            if not name or not score_m:
+                continue
+            score = float(score_m.group())
+            if score <= 0 or score > 200:
+                continue
+            name = re.sub(r'^\d{1,3}[.、．）)]\s*', '', name).strip() or str(name)
+            criteria = cells[col_criteria] if 0 <= col_criteria < len(cells) else ''
+            cat_cell = cells[col_cat] if 0 <= col_cat < len(cells) else ''
+            if (cat_cell and cat_cell.endswith('分') and len(cat_cell) <= 4
+                    and not cat_cell.startswith(_MD_SCORING_CAT_EXCLUDE)):
+                category = cat_cell
+            elif last_cat:
+                category = _guess_scoring_category(last_cat + name)
+            else:
+                category = _guess_scoring_category(name + criteria[:60])
+            items.append({
+                'category': category,
+                'item': name[:60],
+                'score': int(score) if score == int(score) else score,
+                'criteria': criteria[:200],
+            })
+    return items
 
 
 def extract_scoring_items(text: str, tables: list[dict] | None = None) -> list[dict]:
@@ -995,7 +1332,8 @@ def extract_scoring_items(text: str, tables: list[dict] | None = None) -> list[d
         r'\|\s*([^|]+?)\s*\|\s*(\d{1,2})\s*分?\s*\|\s*([^|]*)\s*\|'
     )
     # ── 模式2: 分值内嵌单元格 | 类别 | 项目名 (6.0分) | 评审标准 |（政府采购常见格式）──
-    inline_score_re = re.compile(r'[\(（]\s*(\d{1,3}(?:\.\d+)?)\s*分\s*[\)）]')
+    # lookbehind 排除 "3/8（3分）" 这类管道口径写法（前面紧跟数字或斜杠的不是分值）
+    inline_score_re = re.compile(r'(?<![\d/.])[\(（]\s*(\d{1,3}(?:\.\d+)?)\s*分\s*[\)）]')
     # 表头关键词（跳过）
     header_keywords = {'评分内容', '评分项', '评审项目', '项目', '分值', '评分标准', '评审标准'}
     # v2.1: 文件清单排除词 + 评分描述词
@@ -1042,8 +1380,9 @@ def extract_scoring_items(text: str, tables: list[dict] | None = None) -> list[d
         combined = item_name + ' ' + criteria
         if not from_inline and any(ex in combined for ex in filelist_exclude):
             continue
-        # v2.1: 要求评分描述词
-        if not any(w in combined for w in scoring_desc_words):
+        # v2.1: 要求评分描述词（先剔除"分钟"，避免"7.9L/分钟"误命中"分"）
+        combined_check = combined.replace('分钟', '')
+        if not any(w in combined_check for w in scoring_desc_words):
             continue
 
         try:
@@ -1137,7 +1476,8 @@ def extract_scoring_items(text: str, tables: list[dict] | None = None) -> list[d
                 combined2 = item_name + ' ' + ' '.join(criteria_lines)
                 if any(ex in combined2 for ex in filelist_exclude):
                     continue
-                if not any(w in combined2 for w in scoring_desc_words):
+                # 剔除"分钟"后再匹配评分描述词，避免"7.9L/分钟"误命中
+                if not any(w in combined2.replace('分钟', '') for w in scoring_desc_words):
                     scoring_section_names2 = [
                         '技术', '商务', '价格', '资信', '业绩', '方案', '服务',
                         '响应', '报价', '资质', '证书', '人员', '团队'
@@ -1155,6 +1495,104 @@ def extract_scoring_items(text: str, tables: list[dict] | None = None) -> list[d
                     'score': score_val,
                     'criteria': ' '.join(criteria_lines)[:200],
                 })
+
+    # ── 模式2b: 多列Markdown评分表（表头定位：评分内容/评分因素 + 分值 列）──
+    # docx→md 路径下表格以md文本存在；仅当前置模式均无结果时启用
+    if not items:
+        items = _extract_md_table_scoring(text)
+
+    # ── 模式3: 散文式评分表（编号+名称+行尾分值），如
+    #     "（1）价格分        30分" / "2）体系证书（3分）" / "1）总体概述：…（6分）"
+    # 父子层级折叠：子项分值和==父项分值时只保留子项，防止总分双算 ──
+    if not items:
+        _NUM_CN = '一二三四五六七八九十'
+        prose_re = re.compile(
+            r'^(?:(?P<pa>[（(][\d' + _NUM_CN + r']{1,3}[)）])|(?P<pb>\d{1,2}[）).、]))?'
+            r'\s*(?P<name>[^\d（(].{0,28}?)\s*'
+            r'(?:(?P<s1>[（(]\d{1,3}(?:\.\d{1,2})?\s*分[)）])|\s{2,}(?P<s2>\d{1,3}(?:\.\d{1,2})?)\s*分)\s*$'
+        )
+
+        def _num_style(prefix: str) -> str:
+            core = prefix.strip('（）()').strip()
+            if not core:
+                return 'none'
+            if all(ch in _NUM_CN for ch in core):
+                return 'cn'
+            return 'fw' if prefix[0] in '（(' else 'hw'
+
+        def _collapse_prose(prose):
+            if not prose:
+                return prose
+            outer = prose[0]['_style']
+            result, i = [], 0
+            while i < len(prose):
+                it = prose[i]
+                children, j = [], i + 1
+                while j < len(prose) and prose[j]['_style'] != outer:
+                    children.append(prose[j])
+                    j += 1
+                if (
+                    len(children) >= 2
+                    and abs(sum(c['score'] for c in children) - it['score']) <= 0.5
+                ):
+                    result.extend(children)
+                    i = j
+                else:
+                    result.append(it)
+                    i += 1
+            total = sum(it['score'] for it in result)
+            if total > 100:
+                best = None
+                for style in ('fw', 'hw', 'cn', 'none'):
+                    grp = [it for it in prose if it['_style'] == style]
+                    s = sum(it['score'] for it in grp)
+                    if grp and 0 < s <= 100 and (best is None or s > best[1]):
+                        best = (grp, s)
+                if best:
+                    return best[0]
+            return result
+
+        prose_items = []
+        for line in text.split('\n'):
+            line_s = line.strip()
+            if not line_s or line_s.startswith('|'):
+                continue
+            m3 = prose_re.match(line_s)
+            if not m3:
+                continue
+            val_str = m3.group('s1') or m3.group('s2')
+            if not val_str:
+                continue
+            vm = re.search(r'[\d.]+', val_str)
+            if not vm:
+                continue
+            score = float(vm.group())
+            if score == 0 or score > 100:
+                continue
+            prefix = m3.group('pa') or m3.group('pb') or ''
+            name = m3.group('name').strip().rstrip('：: ')
+            if not name:
+                continue
+            prose_items.append({
+                'category': _guess_category(name),
+                'item': name,
+                'score': int(score) if score == int(score) else score,
+                'criteria': '',
+                '_style': _num_style(prefix),
+            })
+        # 折叠前先按(名称,分值)去重（概览段与详情段的重复标题行会干扰层级折叠）
+        _dedup_prose = []
+        _seen_prose = set()
+        for _pit in prose_items:
+            _pk = (_pit['item'], _pit['score'])
+            if _pk not in _seen_prose:
+                _seen_prose.add(_pk)
+                _dedup_prose.append(_pit)
+        prose_items = _dedup_prose
+
+        for it in _collapse_prose(prose_items):
+            it.pop('_style', None)
+            items.append(it)
 
     # 去重（同名的保留第一个）
     seen: set[str] = set()
@@ -1434,27 +1872,42 @@ def extract_qualification_requirements(text: str) -> list[dict]:
     return unique
 
 
-def parse_bid_document(file_path):
-    """主函数：拆解招标文件"""
+def parse_bid_document(file_path, extra_tables=None):
+    """主函数：拆解招标文件。
+
+    extra_tables: 调用方预提取的结构化表格（如web层从原始docx提取），
+    输入文件本身是md/txt（docx转换产物）时由此接入表格通道。
+    """
     print(f"正在读取：{file_path}", file=sys.stderr)
     text = read_input_file(file_path)
     print(f"文本长度：{len(text)} 字符", file=sys.stderr)
-    
-    # PDF文件：提取结构化表格数据，合并到文本流中
+
+    # PDF/DOCX文件：提取结构化表格数据，合并到文本流中
     # 这样下游所有提取函数都能自然消费表格内容（评分表/废标表/资质表等）
     tables = []
-    if Path(file_path).suffix.lower() == '.pdf':
+    suffix = Path(file_path).suffix.lower()
+    if suffix == '.pdf':
         print("正在提取结构化表格...", file=sys.stderr)
         tables = extract_tables_from_pdf(file_path)
-        if tables:
-            table_md_parts = [t["markdown"] for t in tables if t.get("markdown")]
-            if table_md_parts:
-                text = text + "\n\n" + "\n\n".join(table_md_parts)
-                print(f"表格提取：{len(tables)} 个表格，已合并到文本流", file=sys.stderr)
-            else:
-                print(f"表格提取：{len(tables)} 个表格，但无有效内容", file=sys.stderr)
+        append_table_md = True
+    elif suffix == '.docx':
+        print("正在提取docx结构化表格...", file=sys.stderr)
+        tables = extract_tables_from_docx(file_path)
+        # docx 文本已在 read_input_file 中按文档顺序内联表格md，不再重复追加
+        append_table_md = False
+    else:
+        append_table_md = True
+    if extra_tables:
+        tables = list(extra_tables) + tables
+    if tables and append_table_md:
+        table_md_parts = [t["markdown"] for t in tables if t.get("markdown")]
+        if table_md_parts:
+            text = text + "\n\n" + "\n\n".join(table_md_parts)
+            print(f"表格提取：{len(tables)} 个表格，已合并到文本流", file=sys.stderr)
         else:
-            print("表格提取：未检测到表格", file=sys.stderr)
+            print(f"表格提取：{len(tables)} 个表格，但无有效内容", file=sys.stderr)
+    else:
+        print("表格提取：未检测到表格", file=sys.stderr)
     
     result = {
         "文件名": Path(file_path).name,

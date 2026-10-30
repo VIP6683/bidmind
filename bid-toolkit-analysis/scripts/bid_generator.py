@@ -175,11 +175,14 @@ def detect_bid_type(rfp_text: str, detection_yaml_path: Path) -> tuple[str, dict
                 score += 1 * min(count, 3)
                 matched_medium.append(f'{kw}({count})')
 
-        # 排除条件检查：排除词大量出现时直接否决该类型
-        # （如施工标里也会大量出现"服务/管理"等服务信号词，仅减分不足以纠偏）
+        # 排除条件检查：排除词大量出现时否决该类型（通用规则，跨行业适用）
+        # v2.3: 交叉验证——要求 ≥2 个不同的排除词同时命中且合计>5次，
+        #       防止单个通用词（如混合型项目里偶尔出现的"质保期"）误杀该类型
         exclude_kw = rule.get('exclude_if_dominant', [])
-        exclude_hits = sum(rfp_text.count(kw) for kw in exclude_kw)
-        if exclude_hits > 5:
+        exclude_counts = {kw: rfp_text.count(kw) for kw in exclude_kw}
+        distinct_hits = sum(1 for c in exclude_counts.values() if c > 0)
+        exclude_hits = sum(exclude_counts.values())
+        if exclude_hits > 5 and (distinct_hits >= 2 or len(exclude_kw) == 1):
             score = 0
 
         threshold = rule.get('confidence_threshold', 5)
@@ -433,6 +436,44 @@ def build_rfp_summary(rfp_data: dict) -> str:
 # 章节内容生成
 # =====================================================================
 
+def _demote_headings(md: str, min_level: int = 4) -> str:
+    """将素材Markdown的标题整体降级，避免注入后干扰章节树层级。
+
+    素材文件顶层的 `#`/`##` 标题注入到章节内部时会变成"伪章节"，
+    这里把所有标题降到 min_level 及以下（最多到 h6），仅保留文档内层级语义。
+    """
+    def _shift(m: re.Match) -> str:
+        level = min(len(m.group('hashes')) + 3, 6)
+        return f'{"#" * level} {m.group("text")}'
+
+    # 先把 ≤min_level 的标题统一抬到 min_level 基准再降，保证相对层级不变
+    normalized = re.sub(r'^(?P<hashes>#{1,3}) (?P<text>.+)$', _shift, md, flags=re.M)
+    # 此时剩余的 4-6 级标题保持原样（已在章节内部层级）
+    return normalized
+
+
+def inject_company_material(section: dict, company_profiles: dict) -> None:
+    """按章节标题关键词把企业素材追加进章节内容（通用关键词，非项目特定）。
+
+    标题含"业绩"→业绩素材；含"资质"→资质素材；含"营业执照"或"民事责任"→企业基本信息。
+    素材标题统一降级为 h4+，避免干扰章节树层级。原地修改 section['content']。
+    """
+    if not company_profiles:
+        return
+    title = section.get('title', '')
+    extra = []
+    if '业绩' in title and company_profiles.get('performance'):
+        extra.append(company_profiles['performance'])
+    if '资质' in title and company_profiles.get('qualifications'):
+        extra.append(company_profiles['qualifications'])
+    if ('营业执照' in title or '民事责任' in title) and company_profiles.get('company_info'):
+        extra.append(company_profiles['company_info'])
+    if extra:
+        section['content'] = section.get('content', '') + '\n\n' + '\n\n'.join(
+            _demote_headings(x) for x in extra
+        )
+
+
 def generate_commercial_section(section: dict, rfp_summary: str, company_profiles: dict) -> str:
     """生成商务标章节（直接使用模板内容，不调用LLM）。
 
@@ -448,19 +489,8 @@ def generate_commercial_section(section: dict, rfp_summary: str, company_profile
         章节Markdown文本
     """
     title = section['title']
+    inject_company_material(section, company_profiles)
     content = section['content']
-
-    # 对于资质证书章节，尝试注入企业资质信息
-    if '资质证书' in title and company_profiles.get('qualifications'):
-        content = content + '\n\n' + company_profiles['qualifications']
-
-    # 对于营业执照章节，注入企业基本信息
-    if '营业执照' in title and company_profiles.get('company_info'):
-        content = content + '\n\n' + company_profiles['company_info']
-
-    # 对于业绩章节，注入企业业绩
-    if '业绩' in title and company_profiles.get('performance'):
-        content = content + '\n\n' + company_profiles['performance']
 
     return f'## {title}\n\n{content}'
 
@@ -504,7 +534,8 @@ def generate_technical_section(
         f'请根据以上信息，为「{title}」章节生成投标文件内容。\n'
         f'要求：\n'
         f'1. 严格按大纲结构生成，包含所有子标题\n'
-        f'2. 需要填写具体数据的地方用 {{占位符}} 标记\n'
+        f'2. 企业素材中已提供的真实信息（投标人名称、资质、业绩、团队、响应能力等）必须直接使用，'
+        f'不得用占位符替代；仅对素材中确实没有的数据（如具体金额、日期）用 {{占位符}} 标记\n'
         f'3. 内容要具体、专业，不要写空话套话\n'
         f'4. 如果招标文件有具体要求（如人员数量、响应时间），必须引用并响应\n'
         f'5. 输出以「## {title}」开头\n'

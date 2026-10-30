@@ -294,14 +294,25 @@ def extract_document_checklist(text):
     checklist = []
 
     # v2.1: 收窄触发词，去掉"应提交"/"需提交"等过宽匹配
-    section_pattern = r'(?:投标文件应至少包括|投标文件应包括|投标文件由以下|投标文件包含|投标文件应包含|投标文件[组构]成|投标文件应至少包括下列部分)[^\n]*'
+    # v2.2: 增加「投标文件目录」触发（政采云格式常见，条目为中文序号）
+    section_pattern = r'(?:投标文件应至少包括|投标文件应包括|投标文件由以下|投标文件包含|投标文件应包含|投标文件[组构]成|投标文件应至少包括下列部分|投标文件目录)[^\n]*'
     matches = list(re.finditer(section_pattern, text))
 
     for match in matches:
+        # v2.2: 触发行本身须是短标题（或以冒号结尾），避免正文中出现"投标文件组成"字样误触发
+        line_start = text.rfind('\n', 0, match.start()) + 1
+        trigger_line = text[line_start:match.end()].strip()
+        if len(trigger_line) > 30 and not trigger_line.rstrip().endswith(('：', ':')):
+            continue
         start = match.end()
         # v2.0: 扩大上下文窗口到2000字符
         context = text[start:start + 2000]
         lines = context.split('\n')
+
+        # v2.2: 连续非条目行计数——超过3行视为清单结束（替代旧"遇一、即停"逻辑，
+        #        因为中文序号条目本身以"一、二、…"开头，不能作为停止标志）
+        cn_item_re = re.compile(r'^[一二三四五六七八九十百]+[、.．]\s*')
+        misses = 0
 
         for line in lines:
             line = line.strip()
@@ -310,8 +321,8 @@ def extract_document_checklist(text):
             # v2.1: 跳过页码噪音如"18 -" / "19 -" / "- 18 -"
             if re.match(r'^-?\s*\d+\s*[-]?\s*$', line) or re.match(r'^-\s*\d+\s*-', line):
                 continue
-            # v2.0: 遇到下一个大章节标题就停（避免抓到别的章节内容）
-            if re.match(r'^[一二三四五六七八九十]+[、.．]\s', line) and len(line) < 30:
+            # v2.2: 遇到"格式X："/"第X章"等格式正文起点即停
+            if re.match(r'^格式\s*[一二三四五六七八九十\d]', line) or re.match(r'^第[一二三四五六七八九十]+章', line):
                 break
             # v2.1: 匹配（1）/ (1) / 1. / 1、/ ① 等，不要求)后跟分隔符
             if re.match(r'^[（(]\d+[)）]', line) or re.match(r'^\d+\s*[、.．]\s', line) or re.match(r'^[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳]', line):
@@ -323,10 +334,22 @@ def extract_document_checklist(text):
                     item = re.sub(r'第\d+页.*$', '', item).strip()
                     if item and len(item) > 2:
                         checklist.append(item)
+                misses = 0
+            # v2.2: 中文序号条目（一、投标函 / 二十六、履约担保函…）
+            elif cn_item_re.match(line) and len(line) < 40:
+                item = cn_item_re.sub('', line).strip()
+                if item and len(item) > 2:
+                    checklist.append(item)
+                misses = 0
             elif re.match(r'^[-•·●]\s+', line):
                 item = re.sub(r'^[-•·●]\s+', '', line).strip()
                 if item and len(item) > 2:
                     checklist.append(item)
+                misses = 0
+            else:
+                misses += 1
+                if misses >= 3:
+                    break
         # v2.0: 不break，继续找下一个匹配（一份招标文件可能有多个文件清单段落）
 
     # 去重
@@ -399,6 +422,57 @@ def extract_outline(text):
         '类似项目业绩', '技术方案', '商务部分', '资信部分', '价格部分',
         '业绩部分', '团队部分', '服务方案', '实施方案', '售后方案',
     ]
+
+    # v2.1: 散文式评分表支持（编号 + 名称 + 行尾分值，如"（1）价格分  30分"/"2）体系证书（3分）"）
+    _NUM_CN = '一二三四五六七八九十'
+    prose_re = re.compile(
+        r'^(?:(?P<pa>[（(][\d' + _NUM_CN + r']{1,3}[)）])|(?P<pb>\d{1,2}[）).、]))?'
+        r'\s*(?P<name>[^\d（(].{0,28}?)\s*'
+        r'(?:(?P<s1>[（(]\d{1,3}(?:\.\d{1,2})?\s*分[)）])|\s{2,}(?P<s2>\d{1,3}(?:\.\d{1,2})?)\s*分)\s*$'
+    )
+    prose_items = []
+
+    def _num_style(prefix: str) -> str:
+        core = prefix.strip('（）()').strip()
+        if not core:
+            return 'none'
+        if all(ch in _NUM_CN for ch in core):
+            return 'cn'
+        return 'fw' if prefix[0] in '（(' else 'hw'
+
+    def _collapse_prose_items(items):
+        """子项分值和==父项分值时用子项替换父项，避免总分双算。"""
+        if not items:
+            return items
+        outer = items[0]['_style']
+        result, i = [], 0
+        while i < len(items):
+            it = items[i]
+            children, j = [], i + 1
+            while j < len(items) and items[j]['_style'] != outer:
+                children.append(items[j])
+                j += 1
+            if (
+                len(children) >= 2
+                and abs(sum(c['分值'] for c in children) - it['分值']) <= 0.5
+            ):
+                result.extend(children)
+                i = j
+            else:
+                result.append(it)
+                i += 1
+        total = sum(it['分值'] for it in result)
+        if total > 100:
+            # 兜底：保留分值和 ≤100 的最大编号样式层
+            best = None
+            for style in ('fw', 'hw', 'cn', 'none'):
+                grp = [it for it in items if it['_style'] == style]
+                s = sum(it['分值'] for it in grp)
+                if grp and 0 < s <= 100 and (best is None or s > best[1]):
+                    best = (grp, s)
+            if best:
+                return best[0]
+        return result
     
     # 扫描找"XX分"行，向上找评分内容名
     for i, line in enumerate(lines_list):
@@ -406,6 +480,22 @@ def extract_outline(text):
         if not line_s:
             continue
         
+        # v2.1: 散文式分值行优先（"（1）价格分  30分" / "2）体系证书（3分）"）
+        prose_m = prose_re.match(line_s)
+        if prose_m:
+            val_str = prose_m.group('s1') or prose_m.group('s2')
+            if val_str:
+                score_val = float(re.search(r'[\d.]+', val_str).group())
+                if 0 < score_val <= 100:
+                    prefix = prose_m.group('pa') or prose_m.group('pb') or ''
+                    prose_items.append({
+                        "项目": prose_m.group('name').strip().rstrip('：: '),
+                        "分值": int(score_val) if score_val == int(score_val) else score_val,
+                        "评分标准": "",
+                        "_style": _num_style(prefix),
+                    })
+            continue
+
         # 匹配 "15 分" / "10分" / "5 分" 这种独立的分值行
         score_match = re.match(r'^(\d{1,2})\s*分$', line_s)
         if not score_match:
@@ -475,12 +565,27 @@ def extract_outline(text):
                 "评分标准": desc_text
             })
     
-    # 去重（同名的保留第一个）
+    # v2.1: 折叠前先按(项目,分值)去重（概览段与详情段的重复标题行会干扰层级折叠）
+    _dedup_prose: list[dict] = []
+    _seen_prose: set[tuple] = set()
+    for _pit in prose_items:
+        _pk = (_pit["项目"], _pit["分值"])
+        if _pk not in _seen_prose:
+            _seen_prose.add(_pk)
+            _dedup_prose.append(_pit)
+    prose_items = _dedup_prose
+
+    # v2.1: 散文式评分项层级折叠后并入
+    scoring_items.extend(_collapse_prose_items(prose_items))
+
+    # 去重（同项目名且同分值的保留第一个，不同分值的同名子项均保留）
     seen_names = set()
     for item in scoring_items:
-        if item["项目"] not in seen_names:
+        item.pop('_style', None)
+        key = (item["项目"], item["分值"])
+        if key not in seen_names:
             outline["来源_评分项"].append(item)
-            seen_names.add(item["项目"])
+            seen_names.add(key)
     
     # 计算总分
     total_score = sum(item["分值"] for item in outline["来源_评分项"])
@@ -491,17 +596,26 @@ def extract_outline(text):
 
 
 def extract_budget(text):
-    """提取预算金额"""
+    """提取预算金额 v2.0: 保留原始单位（万/万元/元），不再丢失“万”字"""
     budgets = []
     patterns = [
-        r'预算[金额]*[：:]\s*(?:人民币)?\s*([\d,，]+(?:\.\d+)?)\s*(?:万?元)',
-        r'最高[限投]*价[：:]\s*(?:人民币)?\s*([\d,，]+(?:\.\d+)?)\s*(?:万?元)',
-        r'控制价[：:]\s*(?:人民币)?\s*([\d,，]+(?:\.\d+)?)\s*(?:万?元)',
+        # 预算金额： / 预算金额为： / 项目预算为
+        r'预算[金额]*[为是]?[：:]\s*(?:人民币)?\s*([\d,，]+(?:\.\d+)?)\s*(万元|万|元)',
+        # 最高限价（如有）： / 最高投标限价：
+        r'最高(?:\s*投\s*标\s*)?限价(?:\s*[（(][^）)]*[）)])?[：:]\s*(?:人民币)?\s*([\d,，]+(?:\.\d+)?)\s*(万元|万|元)',
+        # 招标控制价：
+        r'(?:招标)?控制价(?:\s*[（(][^）)]*[）)])?[：:]\s*(?:人民币)?\s*([\d,，]+(?:\.\d+)?)\s*(万元|万|元)',
+        # 预算金额为 100万元（无冒号写法）
+        r'预算[金额]*为\s*(?:人民币)?\s*([\d,，]+(?:\.\d+)?)\s*(万元|万|元)',
     ]
     for pattern in patterns:
         match = re.search(pattern, text)
         if match:
-            budgets.append(match.group(1).replace(',', '').replace('，', '') + "元")
+            num = match.group(1).replace(',', '').replace('，', '')
+            unit = match.group(2)
+            if unit == '万':  # “100万”规范为“100万元”
+                unit = '万元'
+            budgets.append(num + unit)
     return budgets
 
 
@@ -624,11 +738,12 @@ def extract_deposit(text):
                 current = val
         return total + section + current
     
-    # 投标保证金 - 先试阿拉伯数字，再试中文数字
-    bid_match = re.search(r'投标保证金[数额金额：:\s]*第?\d*\s*包?[：:]?\s*人民币?\s*(\d+(?:[，,]\d+)?(?:\.\d+)?)\s*万?元', text)
+    # 投标保证金 - 先试阿拉伯数字，再试中文数字（单位捕获保留，万/元不混淆）
+    bid_match = re.search(r'投标保证金[数额金额：:\s]*第?\d*\s*包?[：:]?\s*人民币?\s*(\d+(?:[，,]\d+)?(?:\.\d+)?)\s*(万元|万|元)', text)
     if bid_match:
         amt = bid_match.group(1).replace('，','').replace(',','')
-        deposit['投标保证金'] = amt + '元'
+        unit = bid_match.group(2)
+        deposit['投标保证金'] = amt + ('万元' if unit == '万' else unit)
     else:
         cn_match = re.search(r'投标保证金[数额金额：:\s]*第?\d*\s*包?[：:]?\s*人民币?\s*([壹贰叁肆伍陆柒捌玖拾佰仟万亿圆元整]+)', text)
         if cn_match:
@@ -636,11 +751,12 @@ def extract_deposit(text):
             if val > 0:
                 deposit['投标保证金'] = f'{val}元'
     
-    # 履约保证金
-    perf_match = re.search(r'履约保证金[：:；;收取金额\s]*人民币?\s*(\d+(?:[，,]\d+)?(?:\.\d+)?)\s*万?元', text)
+    # 履约保证金（单位捕获保留，万/元不混淆）
+    perf_match = re.search(r'履约保证金[：:；;收取金额\s]*人民币?\s*(\d+(?:[，,]\d+)?(?:\.\d+)?)\s*(万元|万|元)', text)
     if perf_match:
         amt = perf_match.group(1).replace('，','').replace(',','')
-        deposit['履约保证金'] = amt + '元'
+        unit = perf_match.group(2)
+        deposit['履约保证金'] = amt + ('万元' if unit == '万' else unit)
     else:
         cn_match = re.search(r'履约保证金[：:；;收取金额\s]*人民币?\s*([壹贰叁肆伍陆柒捌玖拾佰仟万亿圆元整]+)', text)
         if cn_match:
@@ -913,8 +1029,8 @@ def extract_scoring_items_from_tables(tables: list[dict]) -> list[dict]:
             if "合计" in item or "总计" in item or "小计" in item:
                 continue
 
-            # v2.5c: 逐item验证 - 去除空格后再匹配评分词和区块名
-            item_nospace = item.replace(" ", "")
+            # v2.5c: 逐item验证 - 去除空格后匹配评分词和区块名（剔除"分钟"避免误命中"分"）
+            item_nospace = item.replace(" ", "").replace('分钟', '')
             has_item_desc = any(w in item_nospace for w in SCORING_DESC_WORDS)
             has_item_section = any(s in item_nospace for s in SCORING_SECTION_NAMES)
             if not has_item_desc and not has_item_section:
@@ -995,7 +1111,8 @@ def extract_scoring_items(text: str, tables: list[dict] | None = None) -> list[d
         r'\|\s*([^|]+?)\s*\|\s*(\d{1,2})\s*分?\s*\|\s*([^|]*)\s*\|'
     )
     # ── 模式2: 分值内嵌单元格 | 类别 | 项目名 (6.0分) | 评审标准 |（政府采购常见格式）──
-    inline_score_re = re.compile(r'[\(（]\s*(\d{1,3}(?:\.\d+)?)\s*分\s*[\)）]')
+    # lookbehind 排除 "3/8（3分）" 这类管道口径写法（前面紧跟数字或斜杠的不是分值）
+    inline_score_re = re.compile(r'(?<![\d/.])[\(（]\s*(\d{1,3}(?:\.\d+)?)\s*分\s*[\)）]')
     # 表头关键词（跳过）
     header_keywords = {'评分内容', '评分项', '评审项目', '项目', '分值', '评分标准', '评审标准'}
     # v2.1: 文件清单排除词 + 评分描述词
@@ -1042,8 +1159,9 @@ def extract_scoring_items(text: str, tables: list[dict] | None = None) -> list[d
         combined = item_name + ' ' + criteria
         if not from_inline and any(ex in combined for ex in filelist_exclude):
             continue
-        # v2.1: 要求评分描述词
-        if not any(w in combined for w in scoring_desc_words):
+        # v2.1: 要求评分描述词（先剔除"分钟"，避免"7.9L/分钟"误命中"分"）
+        combined_check = combined.replace('分钟', '')
+        if not any(w in combined_check for w in scoring_desc_words):
             continue
 
         try:
@@ -1137,7 +1255,8 @@ def extract_scoring_items(text: str, tables: list[dict] | None = None) -> list[d
                 combined2 = item_name + ' ' + ' '.join(criteria_lines)
                 if any(ex in combined2 for ex in filelist_exclude):
                     continue
-                if not any(w in combined2 for w in scoring_desc_words):
+                # 剔除"分钟"后再匹配评分描述词，避免"7.9L/分钟"误命中
+                if not any(w in combined2.replace('分钟', '') for w in scoring_desc_words):
                     scoring_section_names2 = [
                         '技术', '商务', '价格', '资信', '业绩', '方案', '服务',
                         '响应', '报价', '资质', '证书', '人员', '团队'
@@ -1155,6 +1274,99 @@ def extract_scoring_items(text: str, tables: list[dict] | None = None) -> list[d
                     'score': score_val,
                     'criteria': ' '.join(criteria_lines)[:200],
                 })
+
+    # ── 模式3: 散文式评分表（编号+名称+行尾分值），如
+    #     "（1）价格分        30分" / "2）体系证书（3分）" / "1）总体概述：…（6分）"
+    # 父子层级折叠：子项分值和==父项分值时只保留子项，防止总分双算 ──
+    if not items:
+        _NUM_CN = '一二三四五六七八九十'
+        prose_re = re.compile(
+            r'^(?:(?P<pa>[（(][\d' + _NUM_CN + r']{1,3}[)）])|(?P<pb>\d{1,2}[）).、]))?'
+            r'\s*(?P<name>[^\d（(].{0,28}?)\s*'
+            r'(?:(?P<s1>[（(]\d{1,3}(?:\.\d{1,2})?\s*分[)）])|\s{2,}(?P<s2>\d{1,3}(?:\.\d{1,2})?)\s*分)\s*$'
+        )
+
+        def _num_style(prefix: str) -> str:
+            core = prefix.strip('（）()').strip()
+            if not core:
+                return 'none'
+            if all(ch in _NUM_CN for ch in core):
+                return 'cn'
+            return 'fw' if prefix[0] in '（(' else 'hw'
+
+        def _collapse_prose(prose):
+            if not prose:
+                return prose
+            outer = prose[0]['_style']
+            result, i = [], 0
+            while i < len(prose):
+                it = prose[i]
+                children, j = [], i + 1
+                while j < len(prose) and prose[j]['_style'] != outer:
+                    children.append(prose[j])
+                    j += 1
+                if (
+                    len(children) >= 2
+                    and abs(sum(c['score'] for c in children) - it['score']) <= 0.5
+                ):
+                    result.extend(children)
+                    i = j
+                else:
+                    result.append(it)
+                    i += 1
+            total = sum(it['score'] for it in result)
+            if total > 100:
+                best = None
+                for style in ('fw', 'hw', 'cn', 'none'):
+                    grp = [it for it in prose if it['_style'] == style]
+                    s = sum(it['score'] for it in grp)
+                    if grp and 0 < s <= 100 and (best is None or s > best[1]):
+                        best = (grp, s)
+                if best:
+                    return best[0]
+            return result
+
+        prose_items = []
+        for line in text.split('\n'):
+            line_s = line.strip()
+            if not line_s or line_s.startswith('|'):
+                continue
+            m3 = prose_re.match(line_s)
+            if not m3:
+                continue
+            val_str = m3.group('s1') or m3.group('s2')
+            if not val_str:
+                continue
+            vm = re.search(r'[\d.]+', val_str)
+            if not vm:
+                continue
+            score = float(vm.group())
+            if score == 0 or score > 100:
+                continue
+            prefix = m3.group('pa') or m3.group('pb') or ''
+            name = m3.group('name').strip().rstrip('：: ')
+            if not name:
+                continue
+            prose_items.append({
+                'category': _guess_category(name),
+                'item': name,
+                'score': int(score) if score == int(score) else score,
+                'criteria': '',
+                '_style': _num_style(prefix),
+            })
+        # 折叠前先按(名称,分值)去重（概览段与详情段的重复标题行会干扰层级折叠）
+        _dedup_prose = []
+        _seen_prose = set()
+        for _pit in prose_items:
+            _pk = (_pit['item'], _pit['score'])
+            if _pk not in _seen_prose:
+                _seen_prose.add(_pk)
+                _dedup_prose.append(_pit)
+        prose_items = _dedup_prose
+
+        for it in _collapse_prose(prose_items):
+            it.pop('_style', None)
+            items.append(it)
 
     # 去重（同名的保留第一个）
     seen: set[str] = set()

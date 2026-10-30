@@ -166,20 +166,24 @@ def detect_bid_type(rfp_text: str, detection_yaml_path: Path) -> tuple[str, dict
         for kw in strong_kw:
             count = rfp_text.count(kw)
             if count > 0:
-                score += 2 * count
+                score += 2 * min(count, 3)  # 单词计数封顶，防长文档通用词刷分
                 matched_strong.append(f'{kw}({count})')
 
         for kw in medium_kw:
             count = rfp_text.count(kw)
             if count > 0:
-                score += 1 * count
+                score += 1 * min(count, 3)
                 matched_medium.append(f'{kw}({count})')
 
-        # 排除条件检查
+        # 排除条件检查：排除词大量出现时否决该类型（通用规则，跨行业适用）
+        # v2.3: 交叉验证——要求 ≥2 个不同的排除词同时命中且合计>5次，
+        #       防止单个通用词（如混合型项目里偶尔出现的"质保期"）误杀该类型
         exclude_kw = rule.get('exclude_if_dominant', [])
-        exclude_hits = sum(rfp_text.count(kw) for kw in exclude_kw)
-        if exclude_hits > 5:
-            score = max(0, score - exclude_hits)
+        exclude_counts = {kw: rfp_text.count(kw) for kw in exclude_kw}
+        distinct_hits = sum(1 for c in exclude_counts.values() if c > 0)
+        exclude_hits = sum(exclude_counts.values())
+        if exclude_hits > 5 and (distinct_hits >= 2 or len(exclude_kw) == 1):
+            score = 0
 
         threshold = rule.get('confidence_threshold', 5)
         scores[type_key] = score
@@ -506,7 +510,8 @@ def generate_technical_section(
         f'2. 需要填写具体数据的地方用 {{占位符}} 标记\n'
         f'3. 内容要具体、专业，不要写空话套话\n'
         f'4. 如果招标文件有具体要求（如人员数量、响应时间），必须引用并响应\n'
-        f'5. 输出以「## {title}」开头'
+        f'5. 输出以「## {title}」开头\n'
+        f'6. 正文按大纲子标题逐节展开，每节约1500-3000字，先列要点再详细论述，内容具体、不写套话'
     )
 
     # 重试生成
@@ -517,7 +522,7 @@ def generate_technical_section(
                 system_prompt=SYSTEM_PROMPT,
                 user_prompt=user_prompt,
                 temperature=0.5,
-                max_tokens=4096,
+                max_tokens=8000,
             )
 
             if response and len(response.strip()) > 50:

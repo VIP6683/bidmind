@@ -17,3 +17,7 @@ demo_output/
 # IDE / 工具
 .trae/
 .vscode/
+
+# 运行时日志
+*.log
+llm_debug.log

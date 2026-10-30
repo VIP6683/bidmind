@@ -1194,11 +1194,15 @@ def scan_data_consistency(doc):
     price_summaries = []
     price_details = []
     
-    # 汇总金额模式
+    # 汇总金额模式（单位捕获，统一换算成元，防万/元混算）
     summary_patterns = [
-        r'(?:报价|总价|合计|汇总|总额)(?:\s*:?\s*)(?:人民币|RMB|¥)?\s*(\d[\d,.]*)\s*(?:万?元|万)',
-        r'(?:投标报价|投标总价)(?:\s*为?\s*)(?:人民币|RMB|¥)?\s*(\d[\d,.]*)\s*(?:万?元|万)',
+        r'(?:报价|总价|合计|汇总|总额)(?:\s*:?\s*)(?:人民币|RMB|¥)?\s*(\d[\d,，]*(?:\.\d+)?)\s*(万元|万|元)',
+        r'(?:投标报价|投标总价)(?:\s*为?\s*)(?:人民币|RMB|¥)?\s*(\d[\d,，]*(?:\.\d+)?)\s*(万元|万|元)',
     ]
+
+    def _to_yuan(num_str: str, unit: str) -> float:
+        value = float(num_str.replace(',', '').replace('，', ''))
+        return value * 10000 if unit in ('万', '万元') else value
     
     for i, para in enumerate(doc.paragraphs):
         text = para.text
@@ -1207,49 +1211,49 @@ def scan_data_consistency(doc):
         for pattern in summary_patterns:
             matches = re.finditer(pattern, text)
             for m in matches:
-                amount_str = m.group(1).replace(',', '')
                 try:
-                    amount = float(amount_str)
+                    amount = _to_yuan(m.group(1), m.group(2))
                     price_summaries.append({
                         "para": i + 1,
                         "amount": amount,
                         "text": text[:60],
                     })
-                except:
+                except (ValueError, IndexError):
                     pass
     
-    # 分项金额模式（序号+金额）
-    detail_pattern = re.compile(r'(\d+)[.、．）)]\s*(.*?)(\d[\d,.]*)\s*(?:元|万)')
+    # 分项金额模式（序号+描述+金额+单位）：描述段禁止数字/点/逗号，防吞数字成金额
+    detail_pattern = re.compile(
+        r'(\d+)[.、．）)]\s*([^\d.,，、]{1,40}?)[：:]?\s*(\d[\d,，]*(?:\.\d+)?)\s*(万元|万|元)'
+    )
     for i, para in enumerate(doc.paragraphs):
         text = para.text
         if not text.strip():
             continue
         matches = detail_pattern.findall(text)
         for m in matches:
-            amount_str = m[2].replace(',', '')
             try:
-                amount = float(amount_str)
+                amount = _to_yuan(m[2], m[3])
                 price_details.append({
                     "para": i + 1,
                     "amount": amount,
                     "item": m[1][:20],
                 })
-            except:
+            except (ValueError, IndexError):
                 pass
     
-    # 检查汇总与分项合计的差值
+    # 检查汇总与分项合计的差值（金额已统一为元，容忍1分钱浮点误差）
     if price_summaries and price_details:
         total_detail = sum(pd["amount"] for pd in price_details)
         for ps in price_summaries:
             diff = abs(ps["amount"] - total_detail)
-            if diff > 0:
+            if diff > 0.01:
                 issues.append({
                     "type": "数据一致性",
                     "subtype": "金额数据不一致",
                     "paragraph": ps["para"],
-                    "detail": (f"报价汇总{ps['amount']}万元，"
-                               f"分项合计{total_detail:.1f}万元 → "
-                               f"差{diff:.1f}万元"),
+                    "detail": (f"报价汇总{ps['amount']:,.2f}元，"
+                               f"分项合计{total_detail:,.2f}元 → "
+                               f"差{diff:,.2f}元"),
                 })
     
     # ─── 12c. 服务期限一致性 ───────────────────────────

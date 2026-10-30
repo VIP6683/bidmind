@@ -107,14 +107,47 @@ class LLMClient:
             print("❌ 需要安装openai库: pip install openai", file=sys.stderr)
             self._client = None
 
+    def _log_full_request(self, params: dict, messages: list):
+        """全量打印入参（stderr + 落盘 llm_debug.log），供逐字核对。
+
+        每次调用完整记录：model/temperature/max_tokens及全部消息原文。
+        日志文件位于本模块同级目录 llm_debug.log（追加写）。
+        """
+        try:
+            ts = time.strftime('%Y-%m-%d %H:%M:%S')
+            lines = [
+                '',
+                '=' * 90,
+                f'[LLM请求] {ts}',
+                f'model = {params.get("model")}',
+                f'temperature = {params.get("temperature")}',
+                f'max_tokens = {params.get("max_tokens")}',
+            ]
+            for k, v in params.items():
+                if k not in ('model', 'temperature', 'max_tokens', 'messages'):
+                    lines.append(f'{k} = {v}')
+            for i, m in enumerate(messages):
+                content = str(m.get('content', ''))
+                lines.append(f'--- message[{i}] role={m.get("role")} chars={len(content)} ---')
+                lines.append(content)
+            full_text = '\n'.join(lines)
+            # 控制台全量打印
+            print(full_text, file=sys.stderr)
+            # 同步落盘（追加）
+            log_file = Path(__file__).resolve().parent / 'llm_debug.log'
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(full_text + '\n')
+        except Exception as e:
+            print(f'LLM入参日志写入失败: {e}', file=sys.stderr)
+
     def chat(self, messages, **kwargs):
         """
         发送聊天请求，内置重试机制
-        
+
         参数：
             messages: OpenAI格式消息列表
             kwargs: 覆盖默认参数（temperature/max_tokens等）
-        
+
         返回：
             str: 模型回复文本，失败时返回空字符串
         """
@@ -130,22 +163,15 @@ class LLMClient:
         }
         params.update(kwargs)
 
+        # 全量入参打印（stderr + llm_debug.log）
+        self._log_full_request(params, messages)
+
         retry_cfg = self.config.get('retry', {})
         max_attempts = retry_cfg.get('max_attempts', 3)
         base_delay = retry_cfg.get('base_delay', 2)
         max_delay = retry_cfg.get('max_delay', 30)
 
         last_error = None
-        # 调试日志：打印实际请求参数（messages 只打预览，避免刷屏）
-        preview = [
-            {'role': m['role'], 'len': len(m['content']), 'preview': m['content'][:80]}
-            for m in messages
-        ]
-        print(f"\n─── LLM 请求参数 ───\n"
-              f"model={params.get('model')} temperature={params.get('temperature')} "
-              f"max_tokens={params.get('max_tokens')}\n"
-              f"messages={json.dumps(preview, ensure_ascii=False)}\n"
-              f"───────────────────", file=sys.stderr)
         for attempt in range(1, max_attempts + 1):
             try:
                 response = self._client.chat.completions.create(

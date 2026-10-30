@@ -1,8 +1,9 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue';
+import { ref, computed, watch, nextTick, onMounted } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { marked } from 'marked';
+import { renderAsync } from 'docx-preview';
 import { getHistoryDetail, deleteHistory, saveDraft, generateDraft, getLlmConfig } from '../api';
 import ChapterTree from '../components/ChapterTree.vue';
 import RiskList from '../components/RiskList.vue';
@@ -21,25 +22,49 @@ const regenerating = ref(false);
 const hasLlmKey = ref(false); // 是否配置了 AI Key，决定重新生成的文案与模式
 const editMode = ref('edit'); // 初稿编辑 tab：edit=源码编辑 / preview=渲染预览
 
-// 重新生成初稿：配置了 Key 走 AI 逐章节撰写；未配置则按本地模板重新生成骨架
+// 重新生成初稿：仅本地模板骨架，不调用 AI
 async function onRegenerate() {
-	const aiMode = hasLlmKey.value;
 	await ElMessageBox.confirm(
-		aiMode
-			? '将调用 AI 重新生成投标初稿并覆盖当前内容（商务标为固定模板格式，AI 仅撰写技术标章节，约1-3分钟），继续吗？'
-			: '未配置 AI Key，将按本地模板重新生成初稿骨架并覆盖当前内容，继续吗？',
-		aiMode ? 'AI重新生成' : '重新生成初稿',
+		'将按本地模板与企业素材重新生成初稿骨架并覆盖当前内容（不调用 AI），继续吗？',
+		'重新生成初稿',
 		{ type: 'warning', confirmButtonText: '开始生成', cancelButtonText: '取消' }
 	);
 	regenerating.value = true;
 	try {
 		const r = await generateDraft(sid);
+		ElMessage.success(`初稿已生成（本地模板模式）：${r.bid_type}，共 ${r.sections} 个章节`);
+		if (r.checklist_added?.length) {
+			ElMessage.info(
+				`已按招标文件「投标文件组成」补充 ${r.checklist_added.length} 个章节：${r.checklist_added.join('、')}`,
+				{ duration: 6000 }
+			);
+		}
+		await load();
+	} finally {
+		regenerating.value = false;
+	}
+}
+
+// AI 生成：显式点击才调用 AI 润色技术标章节（消耗 API 额度）
+async function onAiGenerate() {
+	if (!hasLlmKey.value) {
+		ElMessage.warning('尚未配置 AI Key，请先在「AI模型配置」中填写，或使用本地模板生成');
+		return;
+	}
+	await ElMessageBox.confirm(
+		'将调用 AI 逐章节撰写/润色技术标正文并覆盖当前内容（商务标为固定模板格式，约1-3分钟，消耗 API 额度），继续吗？',
+		'AI生成',
+		{ type: 'warning', confirmButtonText: 'AI生成', cancelButtonText: '取消' }
+	);
+	regenerating.value = true;
+	try {
+		const r = await generateDraft(sid, true);
 		if (r.llm_used) {
 			ElMessage.success(
 				`AI初稿已生成：${r.bid_type}，${r.llm_sections_ok}/${r.tech_sections} 章节AI撰写`
 			);
 		} else {
-			ElMessage.warning('初稿已生成（未配置AI Key，骨架模式），请在 AI模型配置 中填写Key');
+			ElMessage.warning('AI 未生效，已回退本地模板骨架，请检查 AI模型配置');
 		}
 		if (r.checklist_added?.length) {
 			ElMessage.info(
@@ -96,9 +121,52 @@ const depositItems = computed(() => {
 	return Object.entries(d).map(([k, v]) => ({ k, v: String(v) }));
 });
 
-// PDF 原文走浏览器内嵌预览，其余格式走文本对照
+// PDF/Word 原文走 iframe 内嵌预览（docx 用 docx-preview 渲染进 iframe），其余格式走文本对照
 const isPdfSrc = computed(() => (detail.value?.filename || '').toLowerCase().endsWith('.pdf'));
+const isDocxSrc = computed(() => /\.(docx|docm)$/i.test(detail.value?.filename || ''));
 const sourceUrl = computed(() => `/api/source/${sid}`);
+
+// docx → iframe 渲染（保留 Word 排版），仅在首次切到「原文对照」时加载一次
+const docxFrame = ref(null);
+let docxRendered = '';
+watch(
+	() => [activeTab.value, detail.value, isDocxSrc.value],
+	async ([tab, det, isDocx]) => {
+		if (tab !== 'source' || !isDocx || !det) return;
+		if (docxRendered === sid) return;
+		await nextTick();
+		const frame = docxFrame.value;
+		if (!frame) return;
+		try {
+			const res = await fetch(sourceUrl.value);
+			if (!res.ok) throw new Error(`HTTP ${res.status}`);
+			const buf = await res.arrayBuffer();
+			const doc = frame.contentDocument;
+			doc.open();
+			doc.write(
+				'<!DOCTYPE html><html><head><meta charset="utf-8"><style>' +
+					'body{margin:0;background:#e8eaed;overflow:auto}' +
+					'</style></head><body></body></html>'
+			);
+			doc.close();
+			await renderAsync(buf, doc.body, doc.head, {
+				className: 'docx',
+				inWrapper: true,
+				breakPages: true,
+				ignoreLastRenderedPageBreak: false,
+				experimental: true,
+				useBase64URL: true
+			});
+			docxRendered = sid;
+		} catch (e) {
+			console.error('docx 预览失败', e);
+			docxRendered = '';
+			doc.body.innerHTML =
+				'<p style="padding:16px;color:#909399">Word 原文预览加载失败，请改用下方文本对照。</p>';
+		}
+	},
+	{ immediate: true }
+);
 
 // 初稿 markdown 渲染（对照页用已保存内容，编辑页用当前输入）
 const draftHtml = computed(() => marked.parse(detail.value?.draft || ''));
@@ -243,9 +311,40 @@ async function onDelete() {
 									<span class="text-muted" style="font-weight: 400"
 										>共 {{ detail.points.评分项.length }} 项，总分
 										{{ detail.points?.评分总分 ?? '—' }} 分</span
-									></span
-								>
+									>
+									<el-tag
+										v-if="detail.points?.评分校验?.声明总分"
+										:type="
+											detail.points.评分校验.校验 === 'pass'
+												? 'success'
+												: 'warning'
+										"
+										size="small"
+										style="margin-left: 8px"
+										>声明 {{ detail.points.评分校验.声明总分 }} 分 ·
+										{{
+											detail.points.评分校验.校验 === 'pass'
+												? '校验通过'
+												: '差异待复核'
+										}}</el-tag
+									>
+									<el-tag
+										v-for="(v, k) in detail.points?.评分分类汇总 || {}"
+										:key="k"
+										size="small"
+										type="info"
+										style="margin-left: 8px"
+										>{{ k }} {{ v }} 分</el-tag
+									>
+								</span>
 							</div>
+							<el-alert
+								v-if="detail.points?.评分校验?.需人工复核"
+								type="warning"
+								:closable="false"
+								style="margin-bottom: 10px"
+								:title="`评分总分 ${detail.points.评分总分} 与招标声明总分 ${detail.points.评分校验.声明总分 ?? '未知'} 不一致，存在漏提或多提，请人工对照原文复核`"
+							/>
 							<el-table
 								:data="detail.points.评分项"
 								size="small"
@@ -414,6 +513,12 @@ async function onDelete() {
 								class="pdf-frame"
 								title="招标文件原文预览"
 							/>
+							<iframe
+								v-else-if="isDocxSrc"
+								ref="docxFrame"
+								class="pdf-frame docx-frame"
+								title="招标文件原文预览"
+							/>
 							<el-empty
 								v-else-if="!detail.src_md"
 								description="该格式暂未生成对照文本"
@@ -461,17 +566,26 @@ async function onDelete() {
 									</el-radio-group>
 									<el-button
 										size="small"
-										type="success"
 										:loading="regenerating"
 										@click="onRegenerate"
-										>{{
-											regenerating
-												? '生成中…'
-												: hasLlmKey
-													? 'AI重新生成'
-													: '重新生成初稿'
-										}}</el-button
+										>重新生成初稿</el-button
 									>
+									<el-tooltip
+										:content="
+											hasLlmKey
+												? '调用 AI 撰写技术标正文（消耗 API 额度）'
+												: '未配置 AI Key，请先在 AI模型配置 中填写'
+										"
+										placement="top"
+									>
+										<el-button
+											size="small"
+											type="success"
+											:loading="regenerating"
+											@click="onAiGenerate"
+											>AI生成</el-button
+										>
+									</el-tooltip>
 									<el-button
 										size="small"
 										@click="
@@ -728,6 +842,9 @@ async function onDelete() {
 	border: 1px solid var(--border, #eee);
 	border-radius: 8px;
 	background: #525659;
+}
+.docx-frame {
+	background: #e8eaed;
 }
 
 /* markdown 渲染视图（原文对照初稿栏 / 初稿编辑预览） */

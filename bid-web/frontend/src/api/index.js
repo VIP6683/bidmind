@@ -8,7 +8,9 @@ export const uploadFile = (file) => {
 };
 export const parsePoints = (sid) => http.post(`/parse/${sid}`);
 export const reviewTender = (sid) => http.post(`/review/${sid}`);
-export const generateDraft = (sid) => http.post(`/generate/${sid}`);
+// useAi 默认 false：仅本地模板骨架，不调用 AI；显式传 true 且已配置 Key 才走 AI 生成
+export const generateDraft = (sid, useAi = false) =>
+  http.post(`/generate/${sid}`, null, { params: { use_ai: useAi } });
 
 // 历史记录
 export const getHistory = () => http.get('/history');

@@ -3,13 +3,15 @@ import { reactive, ref, onMounted } from 'vue';
 import { ElMessage } from 'element-plus';
 import { getLlmConfig, saveLlmConfig } from '../api';
 
+const DEEPSEEK_BASE_URL = 'https://api.deepseek.com/v1'; // 固定使用 DeepSeek API 地址
+
 const loading = ref(true);
 const saving = ref(false);
 const hasKey = ref(false);
 const form = reactive({
 	api_key: '',
-	base_url: '',
-	model: '',
+	base_url: DEEPSEEK_BASE_URL,
+	model: 'deepseek-chat',
 	temperature: 0.7,
 	max_tokens: 4096,
 	timeout: 60
@@ -20,8 +22,8 @@ onMounted(async () => {
 		const cfg = await getLlmConfig();
 		hasKey.value = cfg.has_key;
 		form.api_key = '';
-		form.base_url = cfg.base_url;
-		form.model = cfg.model;
+		form.base_url = DEEPSEEK_BASE_URL;
+		form.model = cfg.model || 'deepseek-chat';
 		form.temperature = cfg.temperature;
 		form.max_tokens = cfg.max_tokens;
 		form.timeout = cfg.timeout;
@@ -57,15 +59,13 @@ async function onSave() {
 			:closable="false"
 			show-icon
 			style="margin-bottom: 18px"
-			title="配置后技术标章节将由 AI 逐章生成；未配置时自动降级为模板骨架模式，不影响解析与审标。"
+			title="配置后，在投标初稿页面点击「AI生成」按钮才会调用 AI 撰写技术标章节；平时生成初稿均为本地模板模式，不消耗 API 额度。"
 		/>
 
 		<el-form label-width="120px" style="max-width: 640px">
 			<el-form-item label="API 地址">
-				<el-input
-					v-model="form.base_url"
-					placeholder="https://api.deepseek.com/v1（或 Ollama: http://localhost:11434/v1）"
-				/>
+				<el-input v-model="form.base_url" disabled />
+				<div class="text-muted tip">API 地址固定使用 DeepSeek，无需修改</div>
 			</el-form-item>
 			<el-form-item label="API Key">
 				<el-input

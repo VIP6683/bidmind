@@ -36,12 +36,6 @@ function logout() {
 					<div class="logo-name">标析智策</div>
 					<div class="logo-sub">{{ auth.username || '访客用户' }} · 本地内测版</div>
 				</div>
-				<el-tooltip content="展开菜单" placement="right" :disabled="!collapsed">
-					<el-icon class="collapse-btn" @click="collapsed = !collapsed">
-						<Expand v-if="collapsed" />
-						<Fold v-else />
-					</el-icon>
-				</el-tooltip>
 			</div>
 
 			<el-menu
@@ -92,9 +86,7 @@ function logout() {
 					>
 						<el-icon :size="16"><Bell /></el-icon>
 					</el-badge>
-					<el-avatar :size="28" class="avatar-sm">{{
-						(auth.username || '访')[0]
-					}}</el-avatar>
+					<el-avatar :size="28" class="avatar-sm" src="/avatar.jpg"></el-avatar>
 					<el-tooltip content="退出登录" placement="bottom">
 						<el-icon class="logout" @click="logout"><SwitchButton /></el-icon>
 					</el-tooltip>
