@@ -4,7 +4,17 @@ import { useRoute, useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { marked } from 'marked';
 import { renderAsync } from 'docx-preview';
-import { getHistoryDetail, deleteHistory, saveDraft, generateDraft, getLlmConfig } from '../api';
+import {
+	getHistoryDetail,
+	deleteHistory,
+	saveDraft,
+	generateDraft,
+	getLlmConfig,
+	getToolkitCapabilities,
+	runFormatCheck,
+	runAiFlavor,
+	exportToolkitDocx,
+} from '../api';
 import ChapterTree from '../components/ChapterTree.vue';
 import RiskList from '../components/RiskList.vue';
 
@@ -21,6 +31,16 @@ const saving = ref(false);
 const regenerating = ref(false);
 const hasLlmKey = ref(false); // 是否配置了 AI Key，决定重新生成的文案与模式
 const editMode = ref('edit'); // 初稿编辑 tab：edit=源码编辑 / preview=渲染预览
+
+// 质检排版（源码能力接线）
+const exportTemplate = ref('government');
+const exportDark = ref(false);
+const toolkitCaps = ref([]);
+const formatBusy = ref(false);
+const flavorBusy = ref(false);
+const exportBusy = ref(false);
+const formatResult = ref(null);
+const flavorResult = ref(null);
 
 // 重新生成初稿：仅本地模板骨架，不调用 AI
 async function onRegenerate() {
@@ -78,18 +98,86 @@ async function onAiGenerate() {
 	}
 }
 
-onMounted(load);
+onMounted(async () => {
+	await load();
+	getToolkitCapabilities()
+		.then((c) => {
+			toolkitCaps.value = c.capabilities || [];
+		})
+		.catch(() => {});
+});
 
 async function load() {
 	loading.value = true;
 	try {
 		detail.value = await getHistoryDetail(sid);
 		draftText.value = detail.value.draft || '';
+		formatResult.value = detail.value.toolkit?.format_check || null;
+		flavorResult.value = detail.value.toolkit?.ai_flavor || null;
+		if (detail.value.toolkit?.layout?.template) {
+			exportTemplate.value = detail.value.toolkit.layout.template;
+		}
 		getLlmConfig()
 			.then((c) => (hasLlmKey.value = !!c.has_key))
 			.catch(() => {});
 	} finally {
 		loading.value = false;
+	}
+}
+
+async function onFormatCheck(autoFix = false) {
+	if (!detail.value?.draft) {
+		ElMessage.warning('请先生成投标初稿');
+		return;
+	}
+	formatBusy.value = true;
+	try {
+		formatResult.value = await runFormatCheck(sid, autoFix);
+		ElMessage.success(
+			`格式自检完成：${formatResult.value.issue_count || 0} 处问题` +
+				(autoFix ? `，已修复 ${formatResult.value.fixed_count || 0} 项` : '')
+		);
+	} finally {
+		formatBusy.value = false;
+	}
+}
+
+async function onAiFlavor() {
+	if (!detail.value?.draft) {
+		ElMessage.warning('请先生成投标初稿');
+		return;
+	}
+	flavorBusy.value = true;
+	try {
+		flavorResult.value = await runAiFlavor(sid);
+		ElMessage.success(
+			`AI味评分 ${flavorResult.value.score}/100 ${flavorResult.value.grade}，命中 ${flavorResult.value.hit_count} 条`
+		);
+	} finally {
+		flavorBusy.value = false;
+	}
+}
+
+async function onExportToolkit() {
+	if (!detail.value?.draft) {
+		ElMessage.warning('请先生成投标初稿');
+		return;
+	}
+	exportBusy.value = true;
+	try {
+		const blob = await exportToolkitDocx(sid, {
+			template: exportTemplate.value,
+			dark: exportDark.value,
+		});
+		const url = URL.createObjectURL(blob);
+		const a = document.createElement('a');
+		a.href = url;
+		a.download = `${detail.value.filename || sid}_排版稿.docx`;
+		a.click();
+		URL.revokeObjectURL(url);
+		ElMessage.success('已用排版引擎导出 Word');
+	} finally {
+		exportBusy.value = false;
 	}
 }
 
@@ -110,6 +198,13 @@ const agentInfo = computed(() => detail.value?.agent || detail.value?.points?.�
 const outlineGaps = computed(
 	() => detail.value?.outline?.gaps || agentInfo.value?.gaps || {}
 );
+const checklistMeta = computed(
+	() =>
+		detail.value?.outline?.checklist_meta ||
+		agentInfo.value?.checklist_meta ||
+		{}
+);
+const scoringTree = computed(() => detail.value?.outline?.scoring_tree || []);
 
 // 废标自查：未覆盖的排最前
 const dqItems = computed(() => {
@@ -246,12 +341,14 @@ async function onDelete() {
 							>下载初稿</el-button
 						>
 					</a>
-					<a v-if="detail.download_draft" :href="`/api/export/${sid}`">
-						<el-button type="success" plain
-							><el-icon style="margin-right: 4px"><Document /></el-icon
-							>下载Word</el-button
-						>
-					</a>
+					<el-button
+						v-if="detail.draft"
+						type="success"
+						plain
+						:loading="exportBusy"
+						@click="onExportToolkit"
+						>下载Word（排版引擎）</el-button
+					>
 				</div>
 			</div>
 
@@ -428,6 +525,22 @@ async function onDelete() {
 								style="margin-bottom: 10px"
 							/>
 							<el-alert
+								v-if="checklistMeta.empty"
+								title="未识别到第六章「投标文件格式/目录」——未套用货物通用模板；请核对原文目录或配置模型后重跑"
+								type="error"
+								:closable="false"
+								show-icon
+								style="margin-bottom: 10px"
+							/>
+							<el-alert
+								v-else-if="checklistMeta.count"
+								:title="`格式目录 ${checklistMeta.count} 条 · 来源 ${checklistMeta.source || 'rule'}${checklistMeta.recovered ? '（AI兜底）' : ''}`"
+								type="success"
+								:closable="false"
+								show-icon
+								style="margin-bottom: 10px"
+							/>
+							<el-alert
 								v-if="
 									(outlineGaps.checklist_missing || []).length ||
 									(outlineGaps.scoring_uncovered || []).length
@@ -465,8 +578,34 @@ async function onDelete() {
 								</div>
 							</div>
 						</div>
+						<div class="panel" v-if="scoringTree.length">
+							<div class="panel-title">评分树（父项 / 子项）</div>
+							<div
+								v-for="(node, i) in scoringTree"
+								:key="i"
+								style="margin-bottom: 8px; font-size: 13px; line-height: 1.6"
+							>
+								<strong
+									>{{ node.item
+									}}{{ node.score ? `（${node.score}分）` : '' }}</strong
+								>
+								<div
+									v-if="(node.children || []).length"
+									class="text-muted"
+									style="padding-left: 12px"
+								>
+									<span
+										v-for="(ch, j) in node.children"
+										:key="j"
+										style="display: inline-block; margin-right: 10px"
+										>{{ ch.item
+										}}{{ ch.score ? `（${ch.score}分）` : '' }}</span
+									>
+								</div>
+							</div>
+						</div>
 						<div class="panel">
-							<div class="panel-title">章节大纲（模型起草，规则保序与覆盖验收）</div>
+							<div class="panel-title">章节大纲（格式目录保序 · 评分树展开）</div>
 							<el-empty
 								v-if="!outlineSections.length"
 								description="尚未生成大纲，请重新分析或检查模型配置"
@@ -730,12 +869,174 @@ async function onDelete() {
 						</div>
 					</div>
 				</el-tab-pane>
+
+				<!-- 质检排版：接源码 bid engine / check / AI味 -->
+				<el-tab-pane label="质检排版" name="toolkit">
+					<div class="col-stack">
+						<div class="panel">
+							<div class="panel-title">排版引擎导出（bid engine）</div>
+							<div class="toolkit-row">
+								<span class="text-muted">模板</span>
+								<el-select v-model="exportTemplate" size="small" style="width: 220px">
+									<el-option label="政府采购 government" value="government" />
+									<el-option label="企业投标 enterprise" value="enterprise" />
+									<el-option label="工程类 engineering" value="engineering" />
+									<el-option label="货物类 goods" value="goods" />
+								</el-select>
+								<el-checkbox v-model="exportDark">暗标模式</el-checkbox>
+								<el-button
+									type="primary"
+									size="small"
+									:loading="exportBusy"
+									:disabled="!detail.draft"
+									@click="onExportToolkit"
+									>导出 Word</el-button
+								>
+							</div>
+							<div class="text-muted" style="margin-top: 8px; font-size: 12px">
+								默认走源码排版引擎（字体/行距/页边距模板），不再用简易 md2docx。
+							</div>
+						</div>
+
+						<div class="panel">
+							<div class="panel-title">
+								<span
+									>格式自检（fix_bid_format）
+									<span class="text-muted" style="font-weight: 400"
+										>{{
+											formatResult
+												? `· ${formatResult.issue_count || 0} 处问题`
+												: ''
+										}}</span
+									></span
+								>
+								<div>
+									<el-button
+										size="small"
+										:loading="formatBusy"
+										:disabled="!detail.draft"
+										@click="onFormatCheck(false)"
+										>仅扫描</el-button
+									>
+									<el-button
+										size="small"
+										type="warning"
+										:loading="formatBusy"
+										:disabled="!detail.draft"
+										@click="onFormatCheck(true)"
+										>扫描并修复</el-button
+									>
+								</div>
+							</div>
+							<el-empty
+								v-if="!formatResult"
+								description="点击上方按钮，对导出 Word 做格式自检"
+								:image-size="64"
+							/>
+							<template v-else>
+								<div class="info-grid" style="margin-bottom: 10px">
+									<div
+										class="info-item"
+										v-for="(n, t) in formatResult.by_type || {}"
+										:key="t"
+									>
+										<div class="text-muted">{{ t }}</div>
+										<div class="info-value">{{ n }}</div>
+									</div>
+								</div>
+								<el-table
+									:data="(formatResult.issues || []).slice(0, 80)"
+									size="small"
+									border
+									max-height="320"
+								>
+									<el-table-column prop="type" label="类型" width="110" />
+									<el-table-column prop="subtype" label="子类" width="120" />
+									<el-table-column prop="paragraph" label="段" width="60" />
+									<el-table-column prop="detail" label="说明" min-width="200" show-overflow-tooltip />
+									<el-table-column prop="text" label="原文摘录" min-width="160" show-overflow-tooltip />
+								</el-table>
+							</template>
+						</div>
+
+						<div class="panel">
+							<div class="panel-title">
+								<span
+									>AI 味检测（ai_flavor_radar）
+									<span class="text-muted" style="font-weight: 400"
+										>{{
+											flavorResult
+												? `· ${flavorResult.score}/100 ${flavorResult.grade}`
+												: ''
+										}}</span
+									></span
+								>
+								<el-button
+									size="small"
+									type="primary"
+									:loading="flavorBusy"
+									:disabled="!detail.draft"
+									@click="onAiFlavor"
+									>开始检测</el-button
+								>
+							</div>
+							<el-empty
+								v-if="!flavorResult"
+								description="检测初稿中的套话/模板腔，便于去 AI 味"
+								:image-size="64"
+							/>
+							<template v-else>
+								<div class="text-muted" style="margin-bottom: 8px">
+									命中 {{ flavorResult.hit_count }} 条（致命
+									{{ flavorResult.fatal_count || 0 }} / 高
+									{{ flavorResult.high_count || 0 }} / 中
+									{{ flavorResult.medium_count || 0 }} / 低
+									{{ flavorResult.low_count || 0 }}）
+								</div>
+								<el-table
+									:data="(flavorResult.hits || []).slice(0, 80)"
+									size="small"
+									border
+									max-height="320"
+								>
+									<el-table-column prop="severity" label="级别" width="70" />
+									<el-table-column prop="rule_name" label="规则" width="140" />
+									<el-table-column prop="line_num" label="行" width="60" />
+									<el-table-column prop="matched_text" label="命中" min-width="160" show-overflow-tooltip />
+									<el-table-column prop="suggestion" label="建议" min-width="180" show-overflow-tooltip />
+								</el-table>
+							</template>
+						</div>
+
+						<div class="panel" v-if="toolkitCaps.length">
+							<div class="panel-title">源码能力接入进度</div>
+							<el-table :data="toolkitCaps" size="small" border>
+								<el-table-column prop="name" label="能力" width="140" />
+								<el-table-column prop="cli" label="源码/CLI" min-width="160" />
+								<el-table-column label="Web" width="90">
+									<template #default="{ row }">
+										<el-tag :type="row.web ? 'success' : 'info'" size="small">{{
+											row.web ? '已接' : '未接'
+										}}</el-tag>
+									</template>
+								</el-table-column>
+								<el-table-column prop="note" label="备注" min-width="180" show-overflow-tooltip />
+							</el-table>
+						</div>
+					</div>
+				</el-tab-pane>
 			</el-tabs>
 		</template>
 	</div>
 </template>
 
 <style scoped>
+.toolkit-row {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 12px;
+}
 .agent-steps {
 	display: flex;
 	flex-direction: column;

@@ -12,6 +12,28 @@ export const reviewTender = (sid) => http.post(`/review/${sid}`);
 export const generateDraft = (sid, useAi = false) =>
   http.post(`/generate/${sid}`, null, { params: { use_ai: useAi } });
 
+/** 源码能力矩阵 + 排版模板 */
+export const getToolkitCapabilities = () => http.get('/toolkit/capabilities');
+
+/** 格式自检（可选自动修复） */
+export const runFormatCheck = (sid, autoFix = false) =>
+  http.post(`/toolkit/${sid}/format-check`, null, {
+    params: { auto_fix: autoFix },
+    timeout: 120000,
+  });
+
+/** AI 味检测 */
+export const runAiFlavor = (sid) =>
+  http.post(`/toolkit/${sid}/ai-flavor`, null, { timeout: 120000 });
+
+/** 排版引擎导出 Word（返回 blob） */
+export const exportToolkitDocx = (sid, { template = 'government', dark = false } = {}) =>
+  http.get(`/export/${sid}`, {
+    params: { engine: 'toolkit', template, dark },
+    responseType: 'blob',
+    timeout: 180000,
+  });
+
 // 历史记录
 export const getHistory = () => http.get('/history');
 export const getHistoryDetail = (sid) => http.get(`/history/${sid}`);

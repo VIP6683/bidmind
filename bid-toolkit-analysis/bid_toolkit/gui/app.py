@@ -123,8 +123,8 @@ def parse_tender_file(file_obj, output_format="json"):
             # Markdown 格式输出
             yield _format_parse_result_md(result)
 
-    except Exception as e:
-        yield f"解析失败: {e}\n请检查文件格式是否正确。"
+    except (Exception, SystemExit) as e:
+        yield f"解析失败: {e}\n请检查文件格式是否正确（支持 .pdf / .md / .txt）。"
 
 
 def _format_parse_result_md(result):

@@ -30,6 +30,7 @@ def run(
     match_score=None,
     clean=None,
     norm=None,
+    llm_unavail_reason: str | None = None,
 ) -> dict:
     """执行解析智能体。返回 rfp / fusion / outline / agent。"""
     steps: list[dict] = []
@@ -95,6 +96,24 @@ def run(
         steps[-1]["elapsed_sec"] = round(time.time() - t0, 2)
 
     source = (outline or {}).get("source") or ("rules_fallback" if not llm_ok else "unknown")
+    checklist_meta = (outline or {}).get("checklist_meta") or {}
+    scoring_tree = (outline or {}).get("scoring_tree") or (fusion or {}).get("scoring_tree") or []
+    warning = None
+    if not llm_ok:
+        tip = llm_unavail_reason or "AI 不可用"
+        warning = (
+            f"{tip}：大纲与评分仅走本地规则，偏差会明显大于智能体路径。"
+            "请到「AI模型配置」检查 Key，并确认后端已安装 openai 后重新分析。"
+        )
+    elif checklist_meta.get("empty"):
+        warning = (
+            "未识别到招标文件「投标文件格式/目录」。大纲未套用货物通用模板，"
+            "请核对第六章目录后重新分析，或人工补全章节顺序。"
+        )
+    # 解析后清单可能被 AI 兜底写回，确保要点落盘一致
+    if outline and outline.get("checklist"):
+        rfp["文件清单"] = list(outline["checklist"])
+
     agent = {
         "sid": sid,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -102,9 +121,15 @@ def run(
         "llm_used": bool(llm_ok),
         "outline_source": source,
         "outline_chapters": len((outline or {}).get("sections") or []),
+        "checklist_meta": checklist_meta,
+        "scoring_tree_parents": len(scoring_tree),
+        "scoring_tree_children": sum(
+            len(n.get("children") or []) for n in scoring_tree if isinstance(n, dict)
+        ),
         "elapsed_sec": round(time.time() - t_all, 2),
         "steps": steps,
-        "warning": None if llm_ok else "未配置 AI 模型，大纲与评分仅走本地规则，偏差会明显大于智能体路径。请到「AI模型配置」填写 Key 后重新分析。",
+        "warning": warning,
+        "gaps": (outline or {}).get("gaps") or {},
     }
     (Path(output_dir) / f"{sid}_智能体.json").write_text(
         json.dumps(agent, ensure_ascii=False, indent=2), encoding="utf-8",

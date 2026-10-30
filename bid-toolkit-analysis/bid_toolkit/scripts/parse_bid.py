@@ -152,8 +152,7 @@ def read_input_file(file_path):
     """读取输入文件（PDF或Markdown）"""
     path = Path(file_path)
     if not path.exists():
-        print(f"文件不存在：{file_path}", file=sys.stderr)
-        sys.exit(1)
+        raise FileNotFoundError(f"文件不存在：{file_path}")
 
     if path.suffix.lower() == '.pdf':
         return extract_text_from_pdf(str(path))
@@ -161,9 +160,9 @@ def read_input_file(file_path):
         with open(path, 'r', encoding='utf-8') as f:
             return f.read()
     else:
-        print(f"不支持的文件格式：{path.suffix}", file=sys.stderr)
-        print("支持：.pdf / .md / .txt", file=sys.stderr)
-        sys.exit(1)
+        raise ValueError(
+            f"不支持的文件格式：{path.suffix}\n支持：.pdf / .md / .txt"
+        )
 
 
 def extract_format_requirements(text):

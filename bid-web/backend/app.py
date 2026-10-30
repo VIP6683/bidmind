@@ -171,24 +171,40 @@ def _load_parse_bid():
     return parse_bid
 
 
+_LLM_UNAVAIL_REASON: str | None = None
+
+
 def _get_llm_client():
     """按设置页配置动态构建 LLM 客户端；未配置 api_key 时返回 None（走本地模板模式）。
 
     每次请求重新读取配置，设置页保存后无需重启后端即可生效。
     """
+    global _LLM_UNAVAIL_REASON
+    _LLM_UNAVAIL_REASON = None
     from llm_client import LLMClient
 
     if not CONFIG_PATH.exists():
+        _LLM_UNAVAIL_REASON = "未找到 AI 配置文件"
         return None
     try:
         full = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
     except Exception:
+        _LLM_UNAVAIL_REASON = "AI 配置文件读取失败"
         return None
     llm_cfg = full.get("llm") or {}
     if not str(llm_cfg.get("api_key") or "").strip():
+        _LLM_UNAVAIL_REASON = "未配置 AI Key"
+        return None
+    try:
+        import openai  # noqa: F401
+    except ImportError:
+        _LLM_UNAVAIL_REASON = "后端未安装 openai 库（pip install openai）"
         return None
     client = LLMClient(config_path=str(CONFIG_PATH))
-    return client if client.is_available() else None
+    if not client.is_available():
+        _LLM_UNAVAIL_REASON = "AI 客户端初始化失败，请检查 Key 与网络"
+        return None
+    return client
 
 
 class _ScanLLMAdapter:
@@ -384,16 +400,18 @@ def _do_parse(sid: str) -> dict:
     # 智能体：规则解析 + 评分融合 + 模型大纲起草 + 规则验收回修
     import analysis_agent  # noqa: PLC0415
 
+    llm = _get_llm_client()
     bundle = analysis_agent.run(
         sid,
         str(md_path),
         str(sess["src"]),
         extra_tables,
         OUTPUT_DIR,
-        _get_llm_client(),
+        llm,
         match_score=_title_match_score,
         clean=_clean_checklist_item,
         norm=_norm_title,
+        llm_unavail_reason=_LLM_UNAVAIL_REASON,
     )
     result = bundle["rfp"]
     fusion = bundle["fusion"]
@@ -407,8 +425,12 @@ def _do_parse(sid: str) -> dict:
             "llm_used": bundle["agent"].get("llm_used"),
             "outline_source": bundle["agent"].get("outline_source"),
             "outline_chapters": bundle["agent"].get("outline_chapters"),
+            "checklist_meta": bundle["agent"].get("checklist_meta") or {},
+            "scoring_tree_parents": bundle["agent"].get("scoring_tree_parents"),
+            "scoring_tree_children": bundle["agent"].get("scoring_tree_children"),
             "warning": bundle["agent"].get("warning"),
             "steps": bundle["agent"].get("steps") or [],
+            "gaps": bundle["agent"].get("gaps") or {},
         }
     ocr_info = sess.get("ocr_info")
     if ocr_info:
@@ -539,6 +561,10 @@ def parse(sid: str):
             "source": (outline or {}).get("source") or agent.get("outline_source"),
             "chapters": len((outline or {}).get("sections") or []),
             "gaps": (outline or {}).get("gaps") or {},
+            "checklist_meta": (outline or {}).get("checklist_meta")
+            or agent.get("checklist_meta")
+            or {},
+            "scoring_tree": (outline or {}).get("scoring_tree") or [],
         },
         "summary": {
             "废标红线": len(points["废标红线"]),
@@ -860,24 +886,109 @@ def generate(sid: str, use_ai: bool = False):
 
 
 @app.get("/api/export/{sid}")
-def export_docx(sid: str):
-    """投标初稿 md → Word（md2docx 排版转换），每次实时转换以包含最新修正。"""
+def export_docx(
+    sid: str,
+    engine: str = "toolkit",
+    template: str = "government",
+    dark: bool = False,
+):
+    """投标初稿 md → Word。
+
+    - engine=toolkit（默认）：走标书排版引擎 bid_engine + 格式模板
+    - engine=simple：旧版简易 md2docx
+    - template：government|enterprise|engineering|goods
+    - dark：暗标模式
+    """
     if not _get_session(sid):
         return JSONResponse(status_code=404, content={"error": "记录不存在"})
     md_path = OUTPUT_DIR / f"{sid}_投标文件初稿.md"
     if not md_path.exists():
         return JSONResponse(status_code=404, content={"error": "尚未生成投标初稿"})
-    sys.path.insert(0, str(REPO / "scripts"))
-    from md2docx import md_to_docx  # noqa: PLC0415
-
     out_path = OUTPUT_DIR / f"{sid}_投标文件初稿.docx"
     try:
-        md_to_docx(md_path.read_text(encoding="utf-8"), str(out_path))
+        if engine == "simple":
+            sys.path.insert(0, str(REPO / "scripts"))
+            from md2docx import md_to_docx  # noqa: PLC0415
+
+            md_to_docx(md_path.read_text(encoding="utf-8"), str(out_path))
+        else:
+            import toolkit_bridge  # noqa: PLC0415
+
+            toolkit_bridge.export_with_engine(
+                md_path, out_path, template=template or "government", dark_mode=bool(dark),
+            )
+            meta = {
+                "template": template,
+                "dark_mode": bool(dark),
+                "engine": "bid_engine",
+            }
+            (OUTPUT_DIR / f"{sid}_排版.json").write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8",
+            )
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"Word转换失败: {e}"})
     if not out_path.exists():
         return JSONResponse(status_code=500, content={"error": "Word转换失败: 未生成文件"})
     return FileResponse(out_path, filename=f"{_recover_stem(sid)}_投标文件初稿.docx")
+
+
+@app.get("/api/toolkit/capabilities")
+def toolkit_capabilities():
+    """源码能力矩阵：哪些已接到 Web。"""
+    import toolkit_bridge  # noqa: PLC0415
+
+    return {
+        "templates": toolkit_bridge.list_format_templates(),
+        "capabilities": toolkit_bridge.capability_matrix(),
+    }
+
+
+@app.post("/api/toolkit/{sid}/format-check")
+def toolkit_format_check(sid: str, auto_fix: bool = False):
+    """对已导出的 Word 做格式自检（fix_bid_format）。无 docx 时先用排版引擎生成。"""
+    if not _get_session(sid):
+        return JSONResponse(status_code=404, content={"error": "记录不存在"})
+    import toolkit_bridge  # noqa: PLC0415
+
+    md_path = OUTPUT_DIR / f"{sid}_投标文件初稿.md"
+    docx_path = OUTPUT_DIR / f"{sid}_投标文件初稿.docx"
+    if not docx_path.exists():
+        if not md_path.exists():
+            return JSONResponse(status_code=404, content={"error": "尚未生成投标初稿"})
+        try:
+            toolkit_bridge.export_with_engine(md_path, docx_path, template="government")
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"error": f"先导出 Word 失败: {e}"})
+    try:
+        result = toolkit_bridge.format_check_docx(docx_path, auto_fix=auto_fix)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"格式自检失败: {e}"})
+    (OUTPUT_DIR / f"{sid}_格式自检.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    if result.get("report"):
+        (OUTPUT_DIR / f"{sid}_格式自检报告.txt").write_text(result["report"], encoding="utf-8")
+    return result
+
+
+@app.post("/api/toolkit/{sid}/ai-flavor")
+def toolkit_ai_flavor(sid: str):
+    """对投标初稿做 AI 味检测。"""
+    if not _get_session(sid):
+        return JSONResponse(status_code=404, content={"error": "记录不存在"})
+    import toolkit_bridge  # noqa: PLC0415
+
+    md_path = OUTPUT_DIR / f"{sid}_投标文件初稿.md"
+    if not md_path.exists():
+        return JSONResponse(status_code=404, content={"error": "尚未生成投标初稿"})
+    try:
+        result = toolkit_bridge.ai_flavor_scan_file(md_path)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"AI味检测失败: {e}"})
+    (OUTPUT_DIR / f"{sid}_AI味.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    return result
 
 
 @app.get("/api/download/{name}")
@@ -1018,6 +1129,21 @@ def history_detail(sid: str):
         except Exception:
             pass
 
+    def _load_json(name: str):
+        p = OUTPUT_DIR / name
+        if not p.exists():
+            return None
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    toolkit = {
+        "format_check": _load_json(f"{sid}_格式自检.json"),
+        "ai_flavor": _load_json(f"{sid}_AI味.json"),
+        "layout": _load_json(f"{sid}_排版.json"),
+    }
+
     return {
         "sid": sid,
         "filename": idx.get("filename", sess["stem"] + src.suffix),
@@ -1031,6 +1157,7 @@ def history_detail(sid: str):
         "agent": agent,
         "review": review_data,
         "dq_check": dq_check,
+        "toolkit": toolkit,
         "review_report": (OUTPUT_DIR / f"{sid}_审标报告.md").read_text(encoding="utf-8")
         if (OUTPUT_DIR / f"{sid}_审标报告.md").exists() else None,
         "draft": draft,
@@ -1038,6 +1165,7 @@ def history_detail(sid: str):
         "download_draft": f"/api/download/{sid}_投标文件初稿.md" if draft else None,
         "download_report": f"/api/download/{sid}_审标报告.md"
         if (OUTPUT_DIR / f"{sid}_审标报告.md").exists() else None,
+        "download_docx": f"/api/export/{sid}" if draft else None,
     }
 
 

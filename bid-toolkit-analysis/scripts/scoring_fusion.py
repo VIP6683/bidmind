@@ -690,6 +690,22 @@ def _detect_double_count(items: list):
     return hits
 
 
+_RULE_META_NAMES = (
+    '分值比重', '分值构成', '分值权值', '权重构成', '权值构成',
+    '评分因素', '商务技术部分', '报价部分', '总分',
+)
+
+
+def _is_rule_meta_item(name: str) -> bool:
+    """分值构成/比重汇总行不是评分项（如「分值比重|30分|70分|100分」）。"""
+    compact = re.sub(r'\s+', '', str(name or ''))
+    if not compact:
+        return True
+    if compact in _RULE_META_NAMES:
+        return True
+    return any(k in compact for k in ('分值比重', '分值构成', '权重构成', '权值构成'))
+
+
 def _clean_rule_items(rule_items: list):
     rule_clean = []
     for rit in (rule_items or []):
@@ -699,9 +715,12 @@ def _clean_rule_items(rule_items: list):
             continue
         if score <= 0 or score > 100:
             continue
+        item = str(rit.get('item', '') or '').strip()
+        if _is_rule_meta_item(item):
+            continue
         rule_clean.append({
             'category': str(rit.get('category', '') or ''),
-            'item': str(rit.get('item', '') or '').strip(),
+            'item': item,
             'score': score,
             'criteria': str(rit.get('criteria', '') or '')[:500],
             'channel': 'rule',

@@ -28,8 +28,8 @@ from pathlib import Path
 # 占位文案与 app.py _align_outline_with_checklist 逐字一致
 _PLACEHOLDER = "招标文件「投标文件组成」明确要求包含本项，请按招标文件给定格式编制，勿遗漏。"
 
-# 清单条目过滤：归一化后超长视为噪声（与 app.py L644 同规则）
-_MAX_ITEM_LEN = 30
+# 清单条目过滤：归一化后超长视为噪声（政采目录项偶发较长）
+_MAX_ITEM_LEN = 40
 
 # 清单条目 ↔ LLM 章节的匹配阈值（与 app.py _MATCH_THRESHOLD 一致）
 _MATCH_THRESHOLD = 6.0
@@ -37,31 +37,43 @@ _MATCH_THRESHOLD = 6.0
 # 需求章节摘录上限（保首尾截断，与 scoring_fusion 同手法）
 _DEMAND_LIMIT = 12000
 # 评分标准章节摘录上限
-_SCORING_LIMIT = 6000
+_SCORING_LIMIT = 8000
+
+# 评分子项：xxx（0-6分）/ xxx（0～6分）
+_SUB_SCORE_RE = re.compile(
+    r'([\u4e00-\u9fffA-Za-z0-9、/]{2,40}?)'
+    r'[（(]\s*(0\s*[-~～至到]\s*\d+(?:\.\d+)?)\s*分\s*[)）]'
+)
 
 SYSTEM_PROMPT = (
-    "你是资深投标文件结构专家，熟悉政府采购与工程招投标的文件体系。"
-    "你的任务是根据招标文件信息设计投标文件章节大纲，只输出严格 JSON，"
-    "不输出任何解释或 markdown 代码块标记。\n"
+    "你是资深投标文件结构专家，熟悉政府采购与工程招投标。"
+    "你的任务是设计「给人看的投标文件大纲」（兼作下游写正文提纲），"
+    "只输出严格 JSON，不输出解释或 markdown 围栏。\n"
     "硬性规则：\n"
-    "1. 「投标文件组成清单」是硬约束：每个条目必须对应输出中的一个章节，"
-    "标题保留清单原文表述，条目相对顺序不得打乱。\n"
-    "2. 语义归类：投标函/开标一览表/报价/保证金/授权委托书/营业执照资质/"
-    "各类声明函等商务文件 part=商务标；实施方案/技术方案/服务承诺等 part=技术标。\n"
-    "3. 评分项必须逐项落实到承接章节：content 中标注对应评分项名称及分值，"
-    "分值高的评分项（如实施方案30分）应拆分为多条子节要点逐项覆盖，"
-    "不遗漏任何带分值的评分条目。\n"
-    "4. 清单未覆盖但评分项或采购需求需要的内容（实施方案/质量控制/进度保障/"
-    "人员配置/售后服务等）主动补充章节，插入到语义最相关的清单条目之后；"
-    "不得编造清单中不存在的商务文件名称。\n"
-    "5. content 写 3-6 条子节级编制要求要点（含子节标题，对照的评分项+分值+"
-    "招标文件具体要求），不写正文；需人工填写的数据用 {中文占位符} 标注。\n"
-    "6. 风险导向：采购需求与评标办法中的强制性要求（如签章方式、封条管理、"
-    "社保证明时限、响应时间、人员数量下限）必须在对应章节的 content 中显式体现，"
-    "防止正文编写时遗漏导致废标或丢分。\n"
-    "7. 章节总数控制在 8-20 章，不凑数。\n"
+    "1. 「投标文件组成清单」是唯一骨架：每个条目必须对应一章，"
+    "标题保留清单原文，相对顺序不得打乱；不得用货物/服务通用模板章名替换。\n"
+    "2. 语义归类：投标函/报价/授权/声明函/承诺书/偏离表/业绩等 part=商务标；"
+    "技术文件及评分要求的实施方案/人员/质量/应急/售后等 part=技术标。\n"
+    "3. 评分树必须落地：父项与子项均要在 content 中出现名称+分值；"
+    "若清单有「技术文件」等总括章，把高分技术评分项作为该章下的子节要点展开"
+    "（例如项目实施方案拆成进度/运输/验收/装卸/退换货各0-6分），也可在总括章后"
+    "紧跟补充技术专章，但不得打乱清单原有条目顺序。\n"
+    "4. 禁止编造清单中没有的商务文件名；禁止添加与本项目无关的章节"
+    "（如无安装要求则不要「安装调试」「培训方案」）。\n"
+    "5. 每章 content 写 4-8 条可执行编制要点（子节标题+评分锚点+招标硬点），"
+    "面向投标人填写/撰写，不写空洞套话；人工数据用 {中文占位符}。\n"
+    "6. 采购需求硬点必须显式写入对应章：如封条防掺假、近三个月社保、"
+    "人员数量下限、中小企业行业划型、响应时限、煤质指标等。\n"
+    "7. 有清单时章节数≈清单条数+必要技术补充章；无清单时才可按评分树组织，"
+    "并在首章 content 注明「目录未识别，待人工核对」。\n"
     "输出格式：{\"sections\":[{\"title\":\"章节名\",\"content\":\"编制要求\","
     "\"part\":\"商务标|技术标|其他\"}]}"
+)
+
+CHECKLIST_RECOVER_PROMPT = (
+    "你从招标文件「第六章 投标文件格式」或「投标文件组成/目录」中提取投标文件目录条目。"
+    "只输出 JSON：{\"items\":[\"投标函\",\"报价一览表\",...]}。"
+    "要求：保留原文短标题；按原文顺序；不要格式正文里的填空段；不要解释。"
 )
 
 # 内置默认商务关键词（与 bid_generator.COMMERCIAL_KEYWORDS 一致；
@@ -124,33 +136,116 @@ def _clean_checklist(raw_items: list, clean) -> list[str]:
     return items
 
 
-def _collect_scoring_lines(rfp_data: dict, fusion: dict | None) -> list[str]:
-    """评分项 → 提示词行。优先 LLM 融合通道条目，回退规则通道 scoring_items。
-
-    兼容两种键名风格：fusion 条目（item/score/category/criteria，英文键）
-    与 parse_bid 规则条目（评分项/分值/类别/评分标准，中文键）。
-    """
-    items: list = []
+def _iter_scoring_items(rfp_data: dict, fusion: dict | None) -> list[dict]:
+    """统一取出评分条目列表（fusion 优先）。"""
     if isinstance(fusion, dict) and isinstance(fusion.get("items"), list) and fusion["items"]:
-        items = fusion["items"]
-    elif isinstance(rfp_data.get("scoring_items"), list):
-        items = rfp_data["scoring_items"]
+        return [it for it in fusion["items"] if isinstance(it, dict)]
+    raw = rfp_data.get("scoring_items") or []
+    return [it for it in raw if isinstance(it, dict)]
 
-    lines: list[str] = []
-    for it in items[:40]:  # 防超长，评分项一般 <40 条
-        if not isinstance(it, dict):
+
+def _item_name_score_criteria(it: dict) -> tuple[str, str, str]:
+    name = str(it.get("item") or it.get("评分项") or it.get("名称") or "").strip()
+    score = str(it.get("score") or it.get("分值") or "").strip()
+    criteria = str(it.get("criteria") or it.get("评分标准") or "").strip()
+    return name, score, criteria
+
+
+def expand_scoring_children(criteria: str) -> list[dict]:
+    """从评分标准原文拆「名称（0-N分）」子项，供大纲强制展开。"""
+    if not criteria:
+        return []
+    children: list[dict] = []
+    seen: set[str] = set()
+    for m in _SUB_SCORE_RE.finditer(criteria):
+        name = re.sub(r'^[（(\d)）]、.\s]+', '', m.group(1)).strip(" ：:，,、")
+        span = m.group(2).replace(" ", "")
+        key = re.sub(r"\s+", "", name)
+        if len(key) < 2 or key in seen:
             continue
-        name = str(it.get("item") or it.get("评分项") or it.get("名称") or "").strip()
-        score = str(it.get("score") or it.get("分值") or "").strip()
-        cat = str(it.get("category") or it.get("类别") or "").strip()
-        criteria = str(it.get("criteria") or it.get("评分标准") or "").strip()
+        # 过滤类目废话
+        if name in ("得分", "分值", "满分", "评分"):
+            continue
+        seen.add(key)
+        children.append({"item": name, "score": span, "criteria": ""})
+    return children[:12]
+
+
+def _enrich_criteria_from_md(name: str, criteria: str, md_text: str) -> str:
+    """评分标准在规则通道常被截断到 200~300 字；从评标章节原文补全以便拆子项。"""
+    if not md_text or not name:
+        return criteria
+    # 已有足够子项信号则不扩
+    if len(expand_scoring_children(criteria)) >= 3:
+        return criteria
+    section = _locate_scoring_section(md_text) or md_text
+    key = re.sub(r"\s+", "", name)
+    # 在评标原文中定位父项名，向后取一段
+    for m in re.finditer(re.escape(name), section):
+        window = section[m.start(): m.start() + 1800]
+        if "0-" in window or "0～" in window or "0~" in window or "分）" in window:
+            # 合并：原文窗口优先（信息更全）
+            return window if len(window) > len(criteria) else criteria
+    # 宽松：去空白后找
+    compact = re.sub(r"\s+", "", section)
+    idx = compact.find(key)
+    if idx >= 0:
+        # 无法精确映射回原文位置时，至少用 criteria + 窗口内子项句
+        pass
+    return criteria
+
+
+def build_scoring_tree(
+    rfp_data: dict,
+    fusion: dict | None,
+    md_text: str | None = None,
+) -> list[dict]:
+    """父项 + 规则拆出的 children，供提示词与覆盖校验。"""
+    cached = fusion.get("scoring_tree") if isinstance(fusion, dict) else None
+    if isinstance(cached, list) and cached and not md_text:
+        # 已由上游补全过；无新 md 时直接复用
+        return cached
+
+    tree: list[dict] = []
+    for it in _iter_scoring_items(rfp_data, fusion)[:40]:
+        name, score, criteria = _item_name_score_criteria(it)
         if not name:
             continue
+        # 噪声：分值比重/权值说明
+        if "分值比重" in name or name in ("技术部分", "商务部分"):
+            continue
+        if md_text:
+            criteria = _enrich_criteria_from_md(name, criteria, md_text)
+        kids = it.get("children") if isinstance(it.get("children"), list) else None
+        if not kids:
+            kids = expand_scoring_children(criteria)
+        node = {
+            "item": name,
+            "score": score,
+            "category": str(it.get("category") or it.get("类别") or "").strip(),
+            "criteria": criteria[:800],
+            "children": kids,
+        }
+        tree.append(node)
+    return tree
+
+
+def _collect_scoring_lines(rfp_data: dict, fusion: dict | None) -> list[str]:
+    """评分树 → 提示词行（含子项）。"""
+    lines: list[str] = []
+    for it in build_scoring_tree(rfp_data, fusion):
+        cat = it.get("category") or ""
+        name, score = it["item"], it.get("score") or ""
         head = f"- [{cat}] {name}（{score}分）" if score else f"- [{cat}] {name}"
-        if criteria:
-            criteria = criteria[:150]
-            head += f":{criteria}"
+        if it.get("criteria"):
+            head += f"：{it['criteria'][:180]}"
         lines.append(head)
+        for ch in it.get("children") or []:
+            cn = str(ch.get("item") or "").strip()
+            cs = str(ch.get("score") or "").strip()
+            if not cn:
+                continue
+            lines.append(f"  - 子项 {cn}（{cs}分）" if cs else f"  - 子项 {cn}")
     return lines
 
 
@@ -378,25 +473,100 @@ def finalize_sections(raw_sections: list[dict]) -> list[dict]:
 
 
 def _scoring_pairs(rfp_data: dict, fusion: dict | None) -> list[tuple[str, str]]:
-    """(评分项名称, 分值) 列表，供覆盖校验。"""
+    """(评分项名称, 分值) 列表，供覆盖校验；含子项名称。"""
     pairs: list[tuple[str, str]] = []
-    items: list = []
-    if isinstance(fusion, dict) and isinstance(fusion.get("items"), list) and fusion["items"]:
-        items = fusion["items"]
-    elif isinstance(rfp_data.get("scoring_items"), list):
-        items = rfp_data["scoring_items"]
     seen: set[str] = set()
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        name = str(it.get("item") or it.get("评分项") or it.get("名称") or "").strip()
-        score = str(it.get("score") or it.get("分值") or "").strip()
-        key = re.sub(r"\s+", "", name)
-        if len(key) < 2 or key in seen:
-            continue
-        seen.add(key)
-        pairs.append((name, score))
+    for it in build_scoring_tree(rfp_data, fusion):
+        for name, score in (
+            [(it["item"], str(it.get("score") or ""))]
+            + [
+                (str(ch.get("item") or ""), str(ch.get("score") or ""))
+                for ch in (it.get("children") or [])
+            ]
+        ):
+            key = re.sub(r"\s+", "", name)
+            if len(key) < 2 or key in seen:
+                continue
+            if "分值比重" in name:
+                continue
+            seen.add(key)
+            pairs.append((name, score))
     return pairs
+
+
+def recover_checklist_via_llm(llm_client, md_text: str) -> list[str]:
+    """AI①：规则抽不到目录时，从格式章摘录让模型补清单。"""
+    if llm_client is None or not md_text:
+        return []
+    # 优先截取第六章附近，控 token
+    m = re.search(r'第[一二三四五六七八九十百\d]+章\s*[^\n]{0,20}投标文件格式', md_text)
+    if m:
+        excerpt = md_text[m.start(): m.start() + 6000]
+    else:
+        toc = re.search(r'(?m)^目录\s*$', md_text)
+        excerpt = md_text[toc.start(): toc.start() + 4000] if toc else md_text[:5000]
+    user_prompt = (
+        "【招标文件摘录】\n"
+        f"{excerpt}\n\n"
+        "请提取投标文件目录/组成清单条目 JSON。"
+    )
+    try:
+        resp = llm_client.chat_simple(
+            CHECKLIST_RECOVER_PROMPT, user_prompt, temperature=0.0, max_tokens=2000,
+        )
+        if not resp:
+            return []
+        data = _parse_llm_json(resp)
+        items = data.get("items")
+        if not isinstance(items, list):
+            return []
+        return [str(x).strip() for x in items if str(x).strip() and len(str(x).strip()) >= 2][:40]
+    except Exception as exc:  # noqa: BLE001
+        print(f"[清单兜底] LLM 失败: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return []
+
+
+def resolve_checklist(
+    rfp_data: dict,
+    md_path: str,
+    llm_client=None,
+    clean=None,
+) -> tuple[list[str], dict]:
+    """清单解析：规则优先，空则 AI① 兜底。返回 (清单, meta)。"""
+    clean = clean or _default_clean
+    meta = {"source": "rule", "recovered": False, "empty": False}
+    raw = [str(x) for x in (rfp_data.get("文件清单") or []) if str(x).strip()]
+    checklist = _clean_checklist(raw, clean)
+    if checklist:
+        meta["count"] = len(checklist)
+        return checklist, meta
+
+    try:
+        md_text = Path(md_path).read_text(encoding="utf-8", errors="ignore")
+    except Exception:  # noqa: BLE001
+        md_text = ""
+
+    # 再跑一次规则（防止 rfp 缓存旧结果）
+    try:
+        import parse_bid  # noqa: PLC0415
+        raw2 = parse_bid.extract_document_checklist(md_text)
+        checklist = _clean_checklist([str(x) for x in raw2], clean)
+        if checklist:
+            rfp_data["文件清单"] = checklist
+            meta.update({"source": "rule_reparse", "count": len(checklist)})
+            return checklist, meta
+    except Exception:  # noqa: BLE001
+        pass
+
+    recovered = recover_checklist_via_llm(llm_client, md_text)
+    checklist = _clean_checklist(recovered, clean)
+    if checklist:
+        rfp_data["文件清单"] = checklist
+        meta.update({"source": "llm_recover", "recovered": True, "count": len(checklist)})
+        return checklist, meta
+
+    meta.update({"source": "missing", "empty": True, "count": 0})
+    return [], meta
 
 
 def validate_outline_gaps(
@@ -465,8 +635,14 @@ def generate_rule_outline(
     clean=None,
     norm=None,
     match_score=None,
+    fusion: dict | None = None,
+    checklist_meta: dict | None = None,
 ) -> dict | None:
-    """无模型时的规则大纲：清单保序 + 静态模板补技术章节。偏差大于智能体路径。"""
+    """无模型时的规则大纲：清单保序；禁止静默套货物/服务通用模板。
+
+    - 有清单：按清单出章，技术总括章挂评分树子节要点
+    - 无清单：仅按评分树出「待核对」技术章，并标记 incomplete（不灌安装/培训等模板章）
+    """
     clean = clean or _default_clean
     checklist = _clean_checklist(
         [str(x) for x in (rfp_data.get("文件清单") or []) if str(x).strip()],
@@ -476,18 +652,92 @@ def generate_rule_outline(
         md_text = Path(md_path).read_text(encoding="utf-8", errors="ignore")
     except Exception:  # noqa: BLE001
         md_text = ""
-    tpl_titles = _template_titles(md_text)
-    raw: list[dict] = [{"title": t, "content": _PLACEHOLDER, "part": None} for t in checklist]
-    used = {_default_norm(t) for t in checklist}
-    for title in tpl_titles:
-        if _default_norm(title) in used:
-            continue
+    tree = build_scoring_tree(rfp_data, fusion, md_text=md_text)
+    raw: list[dict] = []
+
+    def _tech_content_for(title: str) -> str:
+        """把评分树要点挂到技术相关章。"""
+        bits: list[str] = []
+        for it in tree:
+            name, score = it["item"], it.get("score") or ""
+            # 报价类挂到报价相关章
+            if "报价" in name or "价格" in name:
+                if "报价" not in title and "一览" not in title and "开标" not in title:
+                    continue
+            elif "技术" not in title and "方案" not in title and "实施" not in title:
+                # 非技术总括章：仅挂名称命中的评分项
+                if _default_norm(name) not in _default_norm(title) and name[:4] not in title:
+                    if title not in ("技术文件", "技术方案", "项目实施方案"):
+                        continue
+            line = f"{name}（{score}分）" if score else name
+            kids = it.get("children") or []
+            if kids:
+                kid_txt = "；".join(
+                    f"{c.get('item')}（{c.get('score')}分）" if c.get("score") else str(c.get("item"))
+                    for c in kids if c.get("item")
+                )
+                line += f" → 须分节编制：{kid_txt}"
+            elif it.get("criteria"):
+                line += f"：{it['criteria'][:80]}"
+            bits.append(line)
+            if len(bits) >= 8:
+                break
+        if bits:
+            return "按招标文件编制。" + " | ".join(bits)
+        return "按招标文件评分标准与采购需求编制本章；规则通道未能细化为子节要点，建议配置模型后重跑。"
+
+    if checklist:
+        for t in checklist:
+            is_tech = any(k in t for k in ("技术", "方案", "实施", "服务"))
+            raw.append({
+                "title": t,
+                "content": _tech_content_for(t) if is_tech or t == "技术文件" else _PLACEHOLDER,
+                "part": "技术标" if is_tech or t == "技术文件" else None,
+            })
+        # 清单未点名的高分技术项 → 追加专章（插在清单之后，保清单相对顺序）
+        used = {_default_norm(t) for t in checklist}
+        for it in tree:
+            name = it["item"]
+            if "报价" in name or "价格" in name or "分值比重" in name:
+                continue
+            nkey = _default_norm(name)
+            if nkey in used or any(nkey in u or u in nkey for u in used if len(u) >= 4):
+                continue
+            try:
+                sc = float(it.get("score") or 0)
+            except (TypeError, ValueError):
+                sc = 0.0
+            if sc < 8:
+                continue
+            raw.append({
+                "title": name,
+                "content": _tech_content_for(name),
+                "part": "技术标",
+            })
+            used.add(nkey)
+        source = "rules_checklist"
+    else:
+        # 禁止套用 goods_outline：只给评分树骨架 + 醒目警告
         raw.append({
-            "title": title,
-            "content": "按招标文件评分标准与采购需求编制本章，规则通道未能细化为子节要点。",
-            "part": "技术标",
+            "title": "【待核对】投标文件目录未识别",
+            "content": (
+                "规则未能从招标文件抽出「投标文件格式/目录」。"
+                "请人工对照第六章目录补全章节，或配置模型后重新分析。"
+                "以下章节仅按评分项临时列出，不代表正式装订顺序。"
+            ),
+            "part": "其他",
         })
-        used.add(_default_norm(title))
+        for it in tree:
+            name = it["item"]
+            if "分值比重" in name:
+                continue
+            raw.append({
+                "title": name,
+                "content": _tech_content_for(name),
+                "part": "技术标" if "报价" not in name and "价格" not in name else "商务标",
+            })
+        source = "rules_incomplete"
+
     if not raw:
         return None
     rebuilt, coverage = enforce_checklist(
@@ -498,9 +748,17 @@ def generate_rule_outline(
         return None
     result = _persist_outline(
         sid, output_dir, checklist, sections, coverage, model="rules",
-        extra={"source": "rules_fallback"},
+        extra={
+            "source": source,
+            "checklist_meta": checklist_meta or {"source": "rule", "count": len(checklist)},
+            "scoring_tree": tree,
+            "gaps": {
+                "checklist_missing": [] if checklist else ["（目录未识别）"],
+                "scoring_uncovered": [],
+            },
+        },
     )
-    print(f"[规则大纲] 降级就绪：{len(sections)}章（未调用模型）", file=sys.stderr)
+    print(f"[规则大纲] {source}：{len(sections)}章（未调用模型）", file=sys.stderr)
     return result
 
 
@@ -563,40 +821,94 @@ def run_outline_agent(
     norm=None,
     max_repair: int = 2,
 ) -> tuple[dict | None, list[dict]]:
-    """模型起草 + 规则验收 + 缺口回修。返回 (大纲产物, 步骤轨迹)。"""
+    """清单解析 → 模型起草 → 规则验收 → 缺口回修。返回 (大纲产物, 步骤轨迹)。"""
     steps: list[dict] = []
-    checklist = _clean_checklist(
-        [str(x) for x in (rfp_data.get("文件清单") or []) if str(x).strip()],
-        clean or _default_clean,
+
+    # 0) 清单：规则优先，空则 AI① 兜底（禁止静默套类型模板）
+    checklist, checklist_meta = resolve_checklist(
+        rfp_data, md_path, llm_client=llm_client, clean=clean,
     )
+    if checklist_meta.get("empty"):
+        steps.append({
+            "name": "checklist",
+            "status": "warn",
+            "detail": "未识别到投标文件格式目录；已禁止套用货物/服务通用模板",
+        })
+    elif checklist_meta.get("recovered"):
+        steps.append({
+            "name": "checklist",
+            "status": "ok",
+            "detail": f"规则未命中，AI 兜底补目录 {checklist_meta.get('count', 0)} 条",
+        })
+    else:
+        steps.append({
+            "name": "checklist",
+            "status": "ok",
+            "detail": (
+                f"格式目录 {checklist_meta.get('count', len(checklist))} 条"
+                f"（来源 {checklist_meta.get('source')}）"
+            ),
+        })
+
+    # 丰富评分树 children，写回 fusion 供前端/落盘
+    try:
+        _md_for_tree = Path(md_path).read_text(encoding="utf-8", errors="ignore")
+    except Exception:  # noqa: BLE001
+        _md_for_tree = ""
+    tree = build_scoring_tree(rfp_data, fusion, md_text=_md_for_tree)
+    if isinstance(fusion, dict):
+        fusion["scoring_tree"] = tree
+        by_name = {
+            re.sub(r"\s+", "", str(it.get("item") or it.get("评分项") or "")): it
+            for it in (fusion.get("items") or [])
+            if isinstance(it, dict)
+        }
+        for node in tree:
+            key = re.sub(r"\s+", "", node["item"])
+            if key in by_name and not by_name[key].get("children"):
+                by_name[key]["children"] = node.get("children") or []
+
     scoring_pairs = _scoring_pairs(rfp_data, fusion)
     scoring_block = "\n".join(_collect_scoring_lines(rfp_data, fusion)) or "（未提取到评分项）"
+    n_children = sum(len(n.get("children") or []) for n in tree)
+    steps.append({
+        "name": "scoring_tree",
+        "status": "ok",
+        "detail": f"评分树 {len(tree)} 父项 / {n_children} 子项",
+    })
 
     if llm_client is None:
         outline = generate_rule_outline(
             sid, md_path, rfp_data, output_dir,
             clean=clean, norm=norm, match_score=match_score,
+            fusion=fusion, checklist_meta=checklist_meta,
         )
         steps.append({
             "name": "outline",
-            "status": "degraded",
-            "detail": "未配置模型，已用规则清单+模板生成大纲，偏差可能较大",
+            "status": "degraded" if checklist else "ok",
+            "detail": (
+                "未配置模型：已按格式目录生成规则大纲"
+                if checklist else
+                "未配置模型且目录未识别：仅输出评分树占位，请补 Key 后重跑"
+            ),
         })
         return outline, steps
 
     outline = generate_outline(
         sid, md_path, rfp_data, fusion, llm_client, output_dir,
         match_score=match_score, clean=clean, norm=norm,
+        checklist=checklist, checklist_meta=checklist_meta,
     )
     if outline is None:
         outline = generate_rule_outline(
             sid, md_path, rfp_data, output_dir,
             clean=clean, norm=norm, match_score=match_score,
+            fusion=fusion, checklist_meta=checklist_meta,
         )
         steps.append({
             "name": "outline_llm",
             "status": "error",
-            "detail": "模型起草失败，已回退规则大纲",
+            "detail": "模型起草失败，已回退规则大纲（仍按格式目录，未套通用模板）",
         })
         return outline, steps
 
@@ -606,11 +918,20 @@ def run_outline_agent(
         "detail": f"模型起草 {len(outline.get('sections') or [])} 章",
     })
 
+    persist_extra_base = {
+        "checklist_meta": checklist_meta,
+        "scoring_tree": tree,
+    }
+
     for rnd in range(max_repair):
         gaps = validate_outline_gaps(
             outline["sections"], checklist, scoring_pairs,
             clean=clean, norm=norm, match_score=match_score,
         )
+        # 无清单时不因 checklist_missing 死循环回修
+        if not checklist:
+            gaps["checklist_missing"] = []
+            gaps["ok"] = not gaps.get("scoring_uncovered")
         if gaps["ok"]:
             steps.append({
                 "name": "outline_validate",
@@ -622,9 +943,12 @@ def run_outline_agent(
                 sid, output_dir, checklist, outline["sections"],
                 outline.get("coverage") or {},
                 str(outline.get("model") or ""),
-                extra={"source": "llm+rules", "repair_rounds": rnd, "gaps": {
-                    "checklist_missing": [], "scoring_uncovered": [],
-                }},
+                extra={
+                    **persist_extra_base,
+                    "source": "llm+rules",
+                    "repair_rounds": rnd,
+                    "gaps": {"checklist_missing": [], "scoring_uncovered": []},
+                },
             )
             return outline, steps
         steps.append({
@@ -662,10 +986,15 @@ def run_outline_agent(
         outline = _persist_outline(
             sid, output_dir, checklist, sections, coverage,
             str(outline.get("model") or ""),
-            extra={"source": "llm+rules", "repair_rounds": rnd + 1, "gaps": {
-                "checklist_missing": gaps["checklist_missing"],
-                "scoring_uncovered": gaps["scoring_uncovered"],
-            }},
+            extra={
+                **persist_extra_base,
+                "source": "llm+rules",
+                "repair_rounds": rnd + 1,
+                "gaps": {
+                    "checklist_missing": gaps["checklist_missing"],
+                    "scoring_uncovered": gaps["scoring_uncovered"],
+                },
+            },
         )
         steps.append({
             "name": "outline_repair",
@@ -677,6 +1006,9 @@ def run_outline_agent(
         (outline or {}).get("sections") or [], checklist, scoring_pairs,
         clean=clean, norm=norm, match_score=match_score,
     )
+    if not checklist:
+        final_gaps["checklist_missing"] = ["（目录未识别）"]
+        final_gaps["ok"] = False
     steps.append({
         "name": "outline_validate",
         "status": "ok" if final_gaps["ok"] else "warn",
@@ -690,14 +1022,20 @@ def run_outline_agent(
     })
     if outline:
         outline["gaps"] = final_gaps
+        outline["checklist_meta"] = checklist_meta
+        outline["scoring_tree"] = tree
         _persist_outline(
             sid, output_dir, checklist, outline["sections"],
             outline.get("coverage") or {},
             str(outline.get("model") or ""),
-            extra={"source": outline.get("source") or "llm+rules", "gaps": {
-                "checklist_missing": final_gaps["checklist_missing"],
-                "scoring_uncovered": final_gaps["scoring_uncovered"],
-            }},
+            extra={
+                **persist_extra_base,
+                "source": outline.get("source") or "llm+rules",
+                "gaps": {
+                    "checklist_missing": final_gaps["checklist_missing"],
+                    "scoring_uncovered": final_gaps["scoring_uncovered"],
+                },
+            },
         )
     return outline, steps
 
@@ -712,35 +1050,51 @@ def generate_outline(
     match_score=None,
     clean=None,
     norm=None,
+    checklist: list[str] | None = None,
+    checklist_meta: dict | None = None,
 ) -> dict | None:
     """生成并落盘 {sid}_大纲.json；LLM 不可用/失败返回 None（不抛出、不落盘）。"""
     if llm_client is None:
         return None
     try:
-        checklist = _clean_checklist(
-            [str(x) for x in (rfp_data.get("文件清单") or []) if str(x).strip()],
-            clean or _default_clean,
-        )
+        if checklist is None:
+            checklist, checklist_meta = resolve_checklist(
+                rfp_data, md_path, llm_client=llm_client, clean=clean,
+            )
+        checklist_meta = checklist_meta or {"source": "rule", "count": len(checklist or [])}
+        md_text = Path(md_path).read_text(encoding="utf-8", errors="ignore")
+        tree = build_scoring_tree(rfp_data, fusion, md_text=md_text)
+        # 临时挂到 fusion，让 _collect_scoring_lines 读到补全后的 children
+        if isinstance(fusion, dict):
+            fusion["scoring_tree"] = tree
         scoring_lines = _collect_scoring_lines(rfp_data, fusion)
         brief = _build_project_brief(rfp_data)
 
-        md_text = Path(md_path).read_text(encoding="utf-8", errors="ignore")
         demand = _locate_demand_section(md_text)
         scoring_text = _locate_scoring_section(md_text)
+        # 类型模板仅作「禁止清单」提示，不再作为参考骨架喂给模型
         tpl_titles = _template_titles(md_text)
+        forbid = [t for t in tpl_titles if any(
+            k in t for k in ("安装", "培训", "调试", "选型", "节能环保")
+        )]
 
-        checklist_block = "\n".join(f"{i}. {x}" for i, x in enumerate(checklist, 1)) \
-            if checklist else "（未提取到清单，按评分项与参考骨架自由组织）"
+        if checklist:
+            checklist_block = "\n".join(f"{i}. {x}" for i, x in enumerate(checklist, 1))
+        else:
+            checklist_block = (
+                "（未提取到清单：请仅按评分树组织技术章，首章标明目录未识别，"
+                "禁止使用货物/服务通用模板章名）"
+            )
         scoring_block = "\n".join(scoring_lines) if scoring_lines else "（未提取到评分项）"
-        tpl_block = "\n".join(f"- {t}" for t in tpl_titles) if tpl_titles else "（无）"
+        forbid_block = "\n".join(f"- {t}" for t in forbid) if forbid else "（无）"
 
         user_prompt = (
             f"【投标文件组成清单（硬约束，逐条保序）】\n{checklist_block}\n\n"
-            f"【评分项】\n{scoring_block}\n\n"
+            f"【评分树（父项+子项，须全部写入大纲 content）】\n{scoring_block}\n\n"
             f"【评标办法/评分标准章节原文】\n{scoring_text or '（未定位到评标章节）'}\n\n"
             f"【项目简报】\n{brief}\n\n"
             f"【采购需求摘录】\n{demand or '（未定位到需求章节）'}\n\n"
-            f"【参考大纲骨架（仅参考，不构成约束）】\n{tpl_block}\n\n"
+            f"【禁止套用的无关模板章（除非清单原文出现）】\n{forbid_block}\n\n"
             f"请输出投标文件章节大纲 JSON。"
         )
         resp = llm_client.chat_simple(SYSTEM_PROMPT, user_prompt,
@@ -760,8 +1114,8 @@ def generate_outline(
             raise RuntimeError("大纲章节为空")
 
         try:
-            model = str(llm_client.config.get("model", ""))  # LLMClient.config
-        except Exception:  # noqa: BLE001 - 取不到模型名不影响产物
+            model = str(llm_client.config.get("model", ""))
+        except Exception:  # noqa: BLE001
             model = ""
         result = {
             "sid": sid,
@@ -771,6 +1125,8 @@ def generate_outline(
             "coverage": coverage,
             "model": model,
             "source": "llm",
+            "checklist_meta": checklist_meta,
+            "scoring_tree": tree,
         }
         out_path = Path(output_dir) / f"{sid}_大纲.json"
         out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2),
@@ -780,7 +1136,7 @@ def generate_outline(
               f"{coverage.get('matched', 0)}/{coverage.get('total', 0)}，"
               f"补占位{len(patched)}项，IR={out_path.name}")
         return result
-    except Exception as exc:  # noqa: BLE001 - 失败静默回退，不阻塞分析主流程
+    except Exception as exc:  # noqa: BLE001
         print(f"[LLM大纲] 生成失败（初稿将回退规则路径）: {type(exc).__name__}: {exc}",
               file=sys.stderr)
         return None

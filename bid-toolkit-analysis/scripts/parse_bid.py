@@ -369,78 +369,192 @@ def extract_disqualification_rules(text):
     return unique_rules
 
 
-def extract_document_checklist(text):
-    """提取必须提交的文件清单 v2.0"""
-    checklist = []
+_CN_ITEM_RE = re.compile(r'^[一二三四五六七八九十百]+[、.．]\s*')
+_CHECKLIST_TRAIL_PUNCT_RE = re.compile(r'[；;。．、，,\s]+$')
 
-    # v2.1: 收窄触发词，去掉"应提交"/"需提交"等过宽匹配
-    # v2.2: 增加「投标文件目录」触发（政采云格式常见，条目为中文序号）
-    section_pattern = r'(?:投标文件应至少包括|投标文件应包括|投标文件由以下|投标文件包含|投标文件应包含|投标文件[组构]成|投标文件应至少包括下列部分|投标文件目录)[^\n]*'
+
+def _normalize_checklist_item(raw: str) -> str:
+    """清洗清单条目：去序号残留、尾部标点、页码噪音。"""
+    item = str(raw or "").strip()
+    item = re.sub(r'第\d+页.*$', '', item).strip()
+    item = _CHECKLIST_TRAIL_PUNCT_RE.sub('', item).strip()
+    # 中文弯引号 → ASCII，并压缩「及" 四个承诺 "」类空格
+    for a, b in (
+        ('\u201c', '"'), ('\u201d', '"'), ('\u2018', "'"), ('\u2019', "'"),
+    ):
+        item = item.replace(a, b)
+    item = re.sub(r'\s+', ' ', item).strip()
+    item = re.sub(r'及\s*"\s*', '及"', item)
+    item = re.sub(r'\s*"', '"', item)
+    item = re.sub(r'^["\']+|["\']+$', '', item).strip()
+    if item.count('"') % 2 == 1:
+        item = item + '"'
+    return item
+
+
+def _dedupe_checklist(items):
+    seen = set()
+    unique = []
+    for item in items:
+        name = _normalize_checklist_item(item)
+        if not name or len(name) < 2:
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        unique.append(name)
+    return unique
+
+
+def _parse_cn_checklist_block(lines, stop_on_repeat_first: bool = True):
+    """从「一、xxx；二、yyy」目录块解析条目。
+
+    政采「第六章 投标文件格式」常见形态：目录列完后立刻重复「一、投标函」进入格式正文。
+    stop_on_repeat_first=True 时，再次遇到与首条同名的中文序号行即停。
+    """
+    items = []
+    first_norm = None
+    misses = 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if re.match(r'^-?\s*\d+\s*[-]?\s*$', line) or re.match(r'^-\s*\d+\s*-', line):
+            continue
+        # 格式正文 / 下一章 / 填空提示
+        if (
+            re.match(r'^格式\s*[一二三四五六七八九十\d]', line)
+            or re.match(r'^第[一二三四五六七八九十\d]+章', line)
+            or line.startswith('（采购人）')
+            or line.startswith('(采购人)')
+        ):
+            break
+        if re.match(r'^[（(]\d+[)）]', line) or re.match(r'^\d+\s*[、.．]\s', line) or re.match(r'^[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳]', line):
+            item = re.sub(r'^[（(]\d+[)）]\s*', '', line).strip()
+            item = re.sub(r'^\d+\s*[、.．]\s*', '', item).strip()
+            item = re.sub(r'^[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳]\s*', '', item).strip()
+            item = _normalize_checklist_item(item)
+            if item and len(item) >= 2:
+                items.append(item)
+                if first_norm is None:
+                    first_norm = item
+            misses = 0
+            continue
+        if _CN_ITEM_RE.match(line) and len(line) < 60:
+            item = _normalize_checklist_item(_CN_ITEM_RE.sub('', line))
+            # 「十六、」空标题：目录结束哨兵
+            if not item:
+                break
+            if (
+                stop_on_repeat_first
+                and first_norm
+                and item == first_norm
+                and len(items) >= 3
+            ):
+                break
+            if len(item) >= 2:
+                items.append(item)
+                if first_norm is None:
+                    first_norm = item
+            misses = 0
+            continue
+        if re.match(r'^[-•·●]\s+', line):
+            item = _normalize_checklist_item(re.sub(r'^[-•·●]\s+', '', line))
+            if item and len(item) >= 2:
+                items.append(item)
+                if first_norm is None:
+                    first_norm = item
+            misses = 0
+            continue
+        misses += 1
+        if misses >= 3 and items:
+            break
+    return items
+
+
+def _extract_checklist_from_bid_format_toc(text: str):
+    """政采云/标准范本：第六章「投标文件格式」下的「目录」块。
+
+    开源 bid-toolkit 原抽取只认「投标文件组成」触发词，遇「目录\\n一、投标函；」会抽到 0 条。
+    """
+    if not text:
+        return []
+    # 优先定位「第X章 … 投标文件格式」
+    chapter = re.search(
+        r'第[一二三四五六七八九十百\d]+章\s*[^\n]{0,20}投标文件格式',
+        text,
+    )
+    window = text[chapter.start():] if chapter else text
+    # 在格式章内找独立「目录」行（避免误伤正文「目录」一词）
+    toc = None
+    for m in re.finditer(r'(?m)^目录\s*$', window):
+        toc = m
+        break
+    if toc is None:
+        # 兜底：投标文件目录 / 投标文件组成清单
+        toc = re.search(
+            r'(?m)^(?:投标文件目录|投标文件组成(?:清单)?|投标文件应提交的?文件)\s*[:：]?\s*$',
+            window,
+        )
+    if toc is None:
+        return []
+    block = window[toc.end(): toc.end() + 3500]
+    return _parse_cn_checklist_block(block.split('\n'), stop_on_repeat_first=True)
+
+
+def extract_document_checklist(text):
+    """提取必须提交的文件清单 v2.3
+
+    优先级：
+      1) 第六章投标文件格式「目录」块（政采云主路径）
+      2) 「投标文件组成/应包括…」触发词块（兼容旧范本）
+    取条目数更多的结果；同分偏好格式目录。
+    """
+    candidates = []
+
+    toc_items = _extract_checklist_from_bid_format_toc(text)
+    if toc_items:
+        candidates.append(('format_toc', toc_items))
+
+    checklist = []
+    # v2.1: 收窄触发词；v2.2: 投标文件目录；v2.3: 与格式目录并存择优
+    section_pattern = (
+        r'(?:投标文件应至少包括|投标文件应包括|投标文件由以下|投标文件包含|投标文件应包含|'
+        r'投标文件[组构]成|投标文件应至少包括下列部分|投标文件目录)[^\n]*'
+    )
     matches = list(re.finditer(section_pattern, text))
 
     for match in matches:
-        # v2.2: 触发行本身须是短标题（或以冒号结尾），避免正文中出现"投标文件组成"字样误触发
         line_start = text.rfind('\n', 0, match.start()) + 1
         trigger_line = text[line_start:match.end()].strip()
-        if len(trigger_line) > 30 and not trigger_line.rstrip().endswith(('：', ':')):
-            continue
+        # 长句且非「组成：」标题 → 跳过（如 11.2 叙述句）
+        if len(trigger_line) > 40 and not re.search(r'(目录|清单|下列|以下)\s*[:：]?\s*$', trigger_line):
+            if not trigger_line.rstrip().endswith(('：', ':')):
+                continue
+            # 以冒号结尾但过长的叙述句（含「以及」「和」）也跳过
+            if len(trigger_line) > 50 and ('以及' in trigger_line or '和' in trigger_line):
+                continue
         start = match.end()
-        # v2.0: 扩大上下文窗口到2000字符
-        context = text[start:start + 2000]
-        lines = context.split('\n')
+        context = text[start:start + 2500]
+        items = _parse_cn_checklist_block(context.split('\n'), stop_on_repeat_first=True)
+        checklist.extend(items)
 
-        # v2.2: 连续非条目行计数——超过3行视为清单结束（替代旧"遇一、即停"逻辑，
-        #        因为中文序号条目本身以"一、二、…"开头，不能作为停止标志）
-        cn_item_re = re.compile(r'^[一二三四五六七八九十百]+[、.．]\s*')
-        misses = 0
+    legacy = _dedupe_checklist(checklist)
+    if legacy:
+        candidates.append(('legacy_compose', legacy))
 
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            # v2.1: 跳过页码噪音如"18 -" / "19 -" / "- 18 -"
-            if re.match(r'^-?\s*\d+\s*[-]?\s*$', line) or re.match(r'^-\s*\d+\s*-', line):
-                continue
-            # v2.2: 遇到"格式X："/"第X章"等格式正文起点即停
-            if re.match(r'^格式\s*[一二三四五六七八九十\d]', line) or re.match(r'^第[一二三四五六七八九十]+章', line):
-                break
-            # v2.1: 匹配（1）/ (1) / 1. / 1、/ ① 等，不要求)后跟分隔符
-            if re.match(r'^[（(]\d+[)）]', line) or re.match(r'^\d+\s*[、.．]\s', line) or re.match(r'^[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳]', line):
-                item = re.sub(r'^[（(]\d+[)）]\s*', '', line).strip()
-                item = re.sub(r'^\d+\s*[、.．]\s*', '', item).strip()
-                item = re.sub(r'^[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳]\s*', '', item).strip()
-                if item and len(item) > 2:
-                    # v2.0: 去掉页眉页脚噪音
-                    item = re.sub(r'第\d+页.*$', '', item).strip()
-                    if item and len(item) > 2:
-                        checklist.append(item)
-                misses = 0
-            # v2.2: 中文序号条目（一、投标函 / 二十六、履约担保函…）
-            elif cn_item_re.match(line) and len(line) < 40:
-                item = cn_item_re.sub('', line).strip()
-                if item and len(item) > 2:
-                    checklist.append(item)
-                misses = 0
-            elif re.match(r'^[-•·●]\s+', line):
-                item = re.sub(r'^[-•·●]\s+', '', line).strip()
-                if item and len(item) > 2:
-                    checklist.append(item)
-                misses = 0
-            else:
-                misses += 1
-                if misses >= 3:
-                    break
-        # v2.0: 不break，继续找下一个匹配（一份招标文件可能有多个文件清单段落）
+    if not candidates:
+        return []
 
-    # 去重
-    seen = set()
-    unique = []
-    for item in checklist:
-        if item not in seen:
-            seen.add(item)
-            unique.append(item)
-
-    return unique
+    # 择优：条目数优先；同分优先 format_toc
+    best_src, best_items = max(
+        candidates,
+        key=lambda x: (len(x[1]), 1 if x[0] == 'format_toc' else 0),
+    )
+    # 过短结果不可信（目录通常 ≥5）
+    if best_src != 'format_toc' and len(best_items) < 5 and toc_items and len(toc_items) >= len(best_items):
+        return _dedupe_checklist(toc_items)
+    return _dedupe_checklist(best_items)
 
 
 def extract_outline(text):
@@ -696,7 +810,8 @@ def extract_budget(text):
             if unit == '万':  # “100万”规范为“100万元”
                 unit = '万元'
             budgets.append(num + unit)
-    return budgets
+    # 同一金额可能被多条正则命中，去重保序
+    return list(dict.fromkeys(budgets))
 
 
 def extract_timeline(text):
@@ -818,31 +933,50 @@ def extract_deposit(text):
                 current = val
         return total + section + current
     
-    # 投标保证金 - 先试阿拉伯数字，再试中文数字（单位捕获保留，万/元不混淆）
-    bid_match = re.search(r'投标保证金[数额金额：:\s]*第?\d*\s*包?[：:]?\s*人民币?\s*(\d+(?:[，,]\d+)?(?:\.\d+)?)\s*(万元|万|元)', text)
-    if bid_match:
-        amt = bid_match.group(1).replace('，','').replace(',','')
-        unit = bid_match.group(2)
-        deposit['投标保证金'] = amt + ('万元' if unit == '万' else unit)
+    # 明确「不做要求 / 无需缴纳」优先于金额抽取
+    if re.search(r'投标保证金[^。\n]{0,40}(?:不做要求|不收取|无需缴纳|免收|无须提交)', text):
+        deposit['投标保证金'] = '不做要求'
     else:
-        cn_match = re.search(r'投标保证金[数额金额：:\s]*第?\d*\s*包?[：:]?\s*人民币?\s*([壹贰叁肆伍陆柒捌玖拾佰仟万亿圆元整]+)', text)
-        if cn_match:
-            val = cn_to_int(cn_match.group(1))
-            if val > 0:
-                deposit['投标保证金'] = f'{val}元'
-    
-    # 履约保证金（单位捕获保留，万/元不混淆）
-    perf_match = re.search(r'履约保证金[：:；;收取金额\s]*人民币?\s*(\d+(?:[，,]\d+)?(?:\.\d+)?)\s*(万元|万|元)', text)
-    if perf_match:
-        amt = perf_match.group(1).replace('，','').replace(',','')
-        unit = perf_match.group(2)
-        deposit['履约保证金'] = amt + ('万元' if unit == '万' else unit)
+        # 投标保证金 - 先试阿拉伯数字，再试中文数字（单位捕获保留，万/元不混淆）
+        bid_match = re.search(r'投标保证金[数额金额：:\s]*第?\d*\s*包?[：:]?\s*人民币?\s*(\d+(?:[，,]\d+)?(?:\.\d+)?)\s*(万元|万|元)', text)
+        if bid_match:
+            amt = bid_match.group(1).replace('，','').replace(',','')
+            unit = bid_match.group(2)
+            deposit['投标保证金'] = amt + ('万元' if unit == '万' else unit)
+        else:
+            cn_match = re.search(r'投标保证金[数额金额：:\s]*第?\d*\s*包?[：:]?\s*人民币?\s*([壹贰叁肆伍陆柒捌玖拾佰仟万亿圆元整]+)', text)
+            if cn_match:
+                val = cn_to_int(cn_match.group(1))
+                if val > 0:
+                    deposit['投标保证金'] = f'{val}元'
+
+    # 履约保证金：支持「中标合同金额的X%」与定额
+    if re.search(r'履约保证金[^。\n]{0,40}(?:不做要求|不收取|无需缴纳|免收|无须提交)', text):
+        deposit['履约保证金'] = '不做要求'
     else:
-        cn_match = re.search(r'履约保证金[：:；;收取金额\s]*人民币?\s*([壹贰叁肆伍陆柒捌玖拾佰仟万亿圆元整]+)', text)
-        if cn_match:
-            val = cn_to_int(cn_match.group(1))
-            if val > 0:
-                deposit['履约保证金'] = f'{val}元'
+        perf_pct = re.search(
+            r'履约保证金[^。\n]{0,60}?(?:金额)?[：:]\s*(?:中标|成交)?合同金额的\s*(\d+(?:\.\d+)?)\s*%',
+            text,
+        )
+        if not perf_pct:
+            perf_pct = re.search(
+                r'履约保证金的金额[：:]\s*(?:中标|成交)?合同金额的\s*(\d+(?:\.\d+)?)\s*%',
+                text,
+            )
+        if perf_pct:
+            deposit['履约保证金'] = f'中标合同金额的{perf_pct.group(1)}%'
+        else:
+            perf_match = re.search(r'履约保证金[：:；;收取金额\s]*人民币?\s*(\d+(?:[，,]\d+)?(?:\.\d+)?)\s*(万元|万|元)', text)
+            if perf_match:
+                amt = perf_match.group(1).replace('，','').replace(',','')
+                unit = perf_match.group(2)
+                deposit['履约保证金'] = amt + ('万元' if unit == '万' else unit)
+            else:
+                cn_match = re.search(r'履约保证金[：:；;收取金额\s]*人民币?\s*([壹贰叁肆伍陆柒捌玖拾佰仟万亿圆元整]+)', text)
+                if cn_match:
+                    val = cn_to_int(cn_match.group(1))
+                    if val > 0:
+                        deposit['履约保证金'] = f'{val}元'
     
     # 缴纳方式
     method_match = re.search(r'保证金[可以可]*以下列方式提交[：:]\s*(支票|汇票|本票|银行转账|金融机构|担保)', text)
@@ -1117,12 +1251,16 @@ def extract_scoring_items_from_tables(tables: list[dict]) -> list[dict]:
             if not item:
                 continue
 
-            # 跳过表头行
+            # 跳过表头行 / 分值构成汇总行（如「分值比重|30分|70分|100分」）
             skip_headers = {"评分内容", "评分要素", "评分因素", "评审内容", "评分项目",
                            "分值", "得分", "分数", "评分", "权重", "权值", "权",
                            "评分标准", "评审标准", "评分细则", "评分依据", "评审依据",
-                           "序号", "序", "序号序号", "自评分值", "满分"}
-            if item in skip_headers or re.match(r"^\d+$", item):
+                           "序号", "序", "序号序号", "自评分值", "满分",
+                           "分值比重", "分值构成", "分值权值", "权重构成", "权值构成"}
+            item_compact = re.sub(r"\s+", "", item)
+            if item in skip_headers or item_compact in skip_headers or re.match(r"^\d+$", item):
+                continue
+            if any(k in item_compact for k in ("分值比重", "分值构成", "权重构成", "权值构成")):
                 continue
 
             # v2.5: 跳过合计行
@@ -1274,6 +1412,13 @@ def _extract_md_table_scoring(text: str) -> list[dict]:
             if score <= 0 or score > 200:
                 continue
             name = re.sub(r'^\d{1,3}[.、．）)]\s*', '', name).strip() or str(name)
+            # 分值构成汇总行（「分值比重|30分|70分|100分」）不是评分项
+            name_compact = re.sub(r'\s+', '', name)
+            if name_compact in ('分值比重', '分值构成', '分值权值', '权重构成', '权值构成',
+                              '评分因素', '商务技术部分', '报价部分', '总分'):
+                continue
+            if any(k in name_compact for k in ('分值比重', '分值构成', '权重构成', '权值构成')):
+                continue
             criteria = cells[col_criteria] if 0 <= col_criteria < len(cells) else ''
             cat_cell = cells[col_cat] if 0 <= col_cat < len(cells) else ''
             if (cat_cell and cat_cell.endswith('分') and len(cat_cell) <= 4
@@ -1334,8 +1479,12 @@ def extract_scoring_items(text: str, tables: list[dict] | None = None) -> list[d
     # ── 模式2: 分值内嵌单元格 | 类别 | 项目名 (6.0分) | 评审标准 |（政府采购常见格式）──
     # lookbehind 排除 "3/8（3分）" 这类管道口径写法（前面紧跟数字或斜杠的不是分值）
     inline_score_re = re.compile(r'(?<![\d/.])[\(（]\s*(\d{1,3}(?:\.\d+)?)\s*分\s*[\)）]')
-    # 表头关键词（跳过）
-    header_keywords = {'评分内容', '评分项', '评审项目', '项目', '分值', '评分标准', '评审标准'}
+    # 表头 / 分值构成汇总行（跳过，防「分值比重|30分|70分|100分」混入评分项）
+    header_keywords = {
+        '评分内容', '评分项', '评审项目', '项目', '分值', '评分标准', '评审标准',
+        '分值比重', '分值构成', '分值权值', '权重构成', '权值构成', '评分因素',
+        '商务技术部分', '报价部分', '总分',
+    }
     # v2.1: 文件清单排除词 + 评分描述词
     filelist_exclude = {'附件', '备注', '目录', '格式自拟', '格式见', '投标人须知', '投标文件格式'}
     scoring_desc_words = {'分', '得分', '满分', '扣', '加分', '减分', '评分', '权重'}
@@ -1360,7 +1509,7 @@ def extract_scoring_items(text: str, tables: list[dict] | None = None) -> list[d
             cells = [c.strip() for c in line.strip().strip('|').split('|')]
             hit_idx = next(
                 (i for i, c in enumerate(cells)
-                 if inline_score_re.search(c) and '分值构成' not in c),
+                 if inline_score_re.search(c) and '分值构成' not in c and '分值比重' not in c),
                 -1,
             )
             if hit_idx < 0 or hit_idx + 1 >= len(cells):
@@ -1372,8 +1521,11 @@ def extract_scoring_items(text: str, tables: list[dict] | None = None) -> list[d
                 continue
             from_inline = True
 
-        # 跳过表头
-        if not item_name or item_name in header_keywords or score_str == '分值':
+        # 跳过表头 / 分值构成汇总行
+        item_compact = re.sub(r'\s+', '', item_name or '')
+        if (not item_name or item_name in header_keywords or item_compact in header_keywords
+                or score_str == '分值'
+                or any(k in item_compact for k in ('分值比重', '分值构成', '权重构成', '权值构成'))):
             continue
 
         # v2.1: 排除文件清单项（模式2的括号分值已是评分行强特征，跳过此排除）
