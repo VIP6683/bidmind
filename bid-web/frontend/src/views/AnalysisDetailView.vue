@@ -105,6 +105,12 @@ const overviewText = computed(() => {
 
 const reviewItems = computed(() => detail.value?.review?.items || []);
 
+const outlineSections = computed(() => detail.value?.outline?.sections || []);
+const agentInfo = computed(() => detail.value?.agent || detail.value?.points?.智能体 || {});
+const outlineGaps = computed(
+	() => detail.value?.outline?.gaps || agentInfo.value?.gaps || {}
+);
+
 // 废标自查：未覆盖的排最前
 const dqItems = computed(() => {
 	const items = detail.value?.dq_check?.items || [];
@@ -214,6 +220,20 @@ async function onDelete() {
 						<span v-if="detail.created_at">{{ detail.created_at }}</span>
 						<el-tag v-if="detail.critical" type="danger" size="small" effect="light"
 							>废标级 {{ detail.critical }} 项</el-tag
+						>
+						<el-tag
+							v-if="agentInfo.mode === 'hybrid'"
+							type="success"
+							size="small"
+							effect="light"
+							>智能体 · 模型+规则</el-tag
+						>
+						<el-tag
+							v-else-if="agentInfo.mode === 'rules_only'"
+							type="warning"
+							size="small"
+							effect="light"
+							>智能体 · 仅规则</el-tag
 						>
 					</div>
 				</div>
@@ -383,6 +403,95 @@ async function onDelete() {
 							<div class="doc-item" v-for="(d, i) in detail.points.文件清单" :key="i">
 								{{ d }}
 							</div>
+						</div>
+					</div>
+				</el-tab-pane>
+
+				<el-tab-pane label="投标大纲" name="outline">
+					<div class="col-stack">
+						<div class="panel">
+							<div class="panel-title">
+								<span
+									>智能体轨迹
+									<span class="text-muted" style="font-weight: 400"
+										>{{ agentInfo.outline_source || '—' }} ·
+										{{ outlineSections.length }} 章</span
+									></span
+								>
+							</div>
+							<el-alert
+								v-if="agentInfo.warning"
+								:title="agentInfo.warning"
+								type="warning"
+								:closable="false"
+								show-icon
+								style="margin-bottom: 10px"
+							/>
+							<el-alert
+								v-if="
+									(outlineGaps.checklist_missing || []).length ||
+									(outlineGaps.scoring_uncovered || []).length
+								"
+								type="warning"
+								:closable="false"
+								show-icon
+								style="margin-bottom: 10px"
+								:title="`规则验收仍有缺口：清单缺 ${(outlineGaps.checklist_missing || []).length} 条，评分项未写入 ${(outlineGaps.scoring_uncovered || []).length} 条`"
+							/>
+							<div class="agent-steps" v-if="(agentInfo.steps || []).length">
+								<div
+									class="agent-step"
+									v-for="(st, i) in agentInfo.steps"
+									:key="i"
+								>
+									<el-tag
+										size="small"
+										:type="
+											st.status === 'ok'
+												? 'success'
+												: st.status === 'error'
+													? 'danger'
+													: st.status === 'degraded' || st.status === 'warn'
+														? 'warning'
+														: 'info'
+										"
+										effect="light"
+										>{{ st.name }}</el-tag
+									>
+									<span>{{ st.detail }}</span>
+									<span v-if="st.elapsed_sec" class="text-muted"
+										>{{ st.elapsed_sec }}s</span
+									>
+								</div>
+							</div>
+						</div>
+						<div class="panel">
+							<div class="panel-title">章节大纲（模型起草，规则保序与覆盖验收）</div>
+							<el-empty
+								v-if="!outlineSections.length"
+								description="尚未生成大纲，请重新分析或检查模型配置"
+								:image-size="80"
+							/>
+							<el-table v-else :data="outlineSections" size="small" border>
+								<el-table-column prop="index" label="#" width="50" align="center" />
+								<el-table-column prop="title" label="章节" min-width="160" />
+								<el-table-column prop="part" label="归属" width="90">
+									<template #default="{ row }">
+										<el-tag
+											size="small"
+											:type="row.part === '技术标' ? 'primary' : 'info'"
+											effect="plain"
+											>{{ row.part || (row.is_commercial ? '商务标' : '技术标') }}</el-tag
+										>
+									</template>
+								</el-table-column>
+								<el-table-column
+									prop="content"
+									label="编制要点"
+									min-width="320"
+									show-overflow-tooltip
+								/>
+							</el-table>
 						</div>
 					</div>
 				</el-tab-pane>
@@ -627,6 +736,23 @@ async function onDelete() {
 </template>
 
 <style scoped>
+.agent-steps {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+.agent-step {
+	display: flex;
+	align-items: flex-start;
+	gap: 8px;
+	font-size: 13px;
+	line-height: 1.6;
+}
+.agent-step .el-tag {
+	flex-shrink: 0;
+	margin-top: 1px;
+}
+
 .head {
 	display: flex;
 	justify-content: space-between;

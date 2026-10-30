@@ -13,9 +13,9 @@ export const useAnalysisStore = defineStore('analysis', {
     current: 0,
     steps: [
       { key: 'upload', label: '上传招标文件', status: 'wait' },
-      { key: 'parse', label: '解析招标要点', status: 'wait' },
+      { key: 'parse', label: '智能体分析与大纲', status: 'wait' },
       { key: 'review', label: '审标风险扫描', status: 'wait' },
-      { key: 'generate', label: '生成投标初稿', status: 'wait' },
+      { key: 'generate', label: '生成投标初稿骨架', status: 'wait' },
     ],
     result: null, // { points, summary, review, generate }
     error: '',

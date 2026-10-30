@@ -24,7 +24,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 # ─── 挂载 bid-toolkit 代码路径 ───────────────────────────────
-REPO = Path(r"d:\liyu\bidmind\bidmind\bid-toolkit-analysis")
+REPO = Path(__file__).resolve().parents[2] / "bid-toolkit-analysis"
 sys.path.insert(0, str(REPO / "scripts"))
 sys.path.insert(0, str(REPO))
 
@@ -381,25 +381,35 @@ def _do_parse(sid: str) -> dict:
             extra_tables = parse_bid.extract_tables_from_docx(str(sess["src"]))
         except Exception as e:
             print(f"docx表格通道失败（忽略）: {e}", file=sys.stderr)
-    result = parse_bid.parse_bid_document(str(md_path), extra_tables=extra_tables)
+    # 智能体：规则解析 + 评分融合 + 模型大纲起草 + 规则验收回修
+    import analysis_agent  # noqa: PLC0415
 
-    # 评分项双通道融合：规则候选 + LLM 语义校正 + 程序裁决（总分恒等式校验）
-    fusion = None
-    try:
-        import scoring_fusion
-        llm = _get_llm_client()
-        fusion = scoring_fusion.extract_scoring_fusion(
-            str(md_path), result.get("scoring_items", []), llm,
-            # 原始docx传入：表格整表结构化喂LLM（含合并单元格说明）
-            docx_path=str(sess["src"]) if Path(sess["src"]).suffix.lower() == ".docx" else None,
-        )
-        (OUTPUT_DIR / f"{sid}_评分融合.json").write_text(
-            json.dumps(fusion, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-    except Exception as e:
-        print(f"评分融合失败（回退规则通道）: {e}", file=sys.stderr)
+    bundle = analysis_agent.run(
+        sid,
+        str(md_path),
+        str(sess["src"]),
+        extra_tables,
+        OUTPUT_DIR,
+        _get_llm_client(),
+        match_score=_title_match_score,
+        clean=_clean_checklist_item,
+        norm=_norm_title,
+    )
+    result = bundle["rfp"]
+    fusion = bundle["fusion"]
+    sess["agent"] = bundle.get("agent")
+    sess["outline"] = bundle.get("outline")
 
     points = slim_points(result, fusion)
+    if bundle.get("agent"):
+        points["智能体"] = {
+            "mode": bundle["agent"].get("mode"),
+            "llm_used": bundle["agent"].get("llm_used"),
+            "outline_source": bundle["agent"].get("outline_source"),
+            "outline_chapters": bundle["agent"].get("outline_chapters"),
+            "warning": bundle["agent"].get("warning"),
+            "steps": bundle["agent"].get("steps") or [],
+        }
     ocr_info = sess.get("ocr_info")
     if ocr_info:
         points["OCR识别"] = {
@@ -519,8 +529,17 @@ def parse(sid: str):
     t0 = time.time()
     points = _do_parse(sid)
     _index_update(sid, duration_sec=round(time.time() - t0, 1))
+    sess = _get_session(sid) or {}
+    outline = sess.get("outline") or {}
+    agent = points.get("智能体") or sess.get("agent") or {}
     return {
         "points": points,
+        "agent": agent,
+        "outline": {
+            "source": (outline or {}).get("source") or agent.get("outline_source"),
+            "chapters": len((outline or {}).get("sections") or []),
+            "gaps": (outline or {}).get("gaps") or {},
+        },
         "summary": {
             "废标红线": len(points["废标红线"]),
             "评分项": len(points["评分项"]),
@@ -529,6 +548,8 @@ def parse(sid: str):
             "文件清单": len(points["文件清单"]),
             "OCR页数": points.get("OCR识别", {}).get("OCR页数", 0),
             "总页数": points.get("OCR识别", {}).get("总页数", 0),
+            "大纲章节": len((outline or {}).get("sections") or []),
+            "智能体模式": agent.get("mode"),
         },
     }
 
@@ -700,6 +721,34 @@ def _align_outline_with_checklist(
     return rebuilt, notes
 
 
+def _load_llm_outline_sections(sid: str) -> tuple[list[dict] | None, list[str]]:
+    """读取分析阶段 LLM 大纲产物（llm_outline.py 落盘的 {sid}_大纲.json）。
+
+    返回 (sections, checklist_added)；文件不存在/JSON 损坏/结构非法时
+    返回 (None, [])，调用方回退「模板 + 清单对齐」规则路径。
+    checklist_added 取 coverage.missing_patched（程序补占位的清单条目名）。
+    """
+    path = OUTPUT_DIR / f"{sid}_大纲.json"
+    if not path.exists():
+        return None, []
+    try:
+        import llm_outline  # noqa: PLC0415  # 函数内导入，与 scoring_fusion 同模式
+
+        data = json.loads(path.read_text(encoding="utf-8"))
+        raw = data.get("sections")
+        if not isinstance(raw, list) or not raw:
+            return None, []
+        sections = llm_outline.finalize_sections(raw)  # 读取侧再裁决一次，防手改损坏
+        if not sections:
+            return None, []
+        cov = data.get("coverage") or {}
+        added = cov.get("missing_patched")
+        return sections, [str(x) for x in added] if isinstance(added, list) else []
+    except Exception as e:  # noqa: BLE001 - 大纲产物不可用一律回退规则路径
+        print(f"LLM大纲读取失败（回退规则路径）: {e}", file=sys.stderr)
+        return None, []
+
+
 @app.post("/api/generate/{sid}")
 def generate(sid: str, use_ai: bool = False):
     """生成投标文件初稿。
@@ -733,7 +782,7 @@ def generate(sid: str, use_ai: bool = False):
     md_path = normalize_to_md(sess["src"], sess)
     rfp_data = parse_bid.parse_bid_document(str(md_path))
 
-    # 2) 自动识别标书类型（货物/服务/工程），按类型选大纲；识别失败内置兜底服务类
+    # 2) 自动识别标书类型（货物/服务/工程）；类型用于响应字段与回退路径选大纲
     try:
         rfp_text = read_input_file(str(md_path))
     except Exception:
@@ -741,13 +790,16 @@ def generate(sid: str, use_ai: bool = False):
     bid_type, detection_info = detect_bid_type(
         rfp_text, TEMPLATES_DIR / "bid_type_detection.yaml"
     )
-    outline_path = TEMPLATES_DIR / OUTLINE_FILES.get(bid_type, "service_outline.md")
-    sections = parse_outline(outline_path)
 
-    # 2.5) 按招标文件「投标文件目录/组成清单」重建大纲：
-    #      目录条目的名称与顺序为最终结构，默认大纲章节匹配并入，缺失条目补占位
+    # 2.5) 大纲：优先消费分析阶段 LLM 大纲产物（llm_outline.py，清单硬约束）；
+    #      缺失/损坏（老记录、分析时 LLM 失败）回退「静态模板 + 清单对齐」规则路径
     checklist = [str(x).strip() for x in (rfp_data.get("文件清单") or []) if str(x).strip()]
-    sections, checklist_added = _align_outline_with_checklist(sections, checklist)
+    sections, checklist_added = _load_llm_outline_sections(sid)
+    if sections is None:
+        outline_path = TEMPLATES_DIR / OUTLINE_FILES.get(bid_type, "service_outline.md")
+        sections = parse_outline(outline_path)
+        # 目录条目的名称与顺序为最终结构，默认大纲章节匹配并入，缺失条目补占位
+        sections, checklist_added = _align_outline_with_checklist(sections, checklist)
 
     # 3) 企业素材（演示用占位素材目录）
     profiles = load_company_profiles(COMPANY_DIR)
@@ -951,6 +1003,21 @@ def history_detail(sid: str):
     if review_data:
         critical = sum(1 for it in review_data["items"] if str(it["类别"]).startswith("🔴"))
 
+    outline = None
+    outline_path = OUTPUT_DIR / f"{sid}_大纲.json"
+    if outline_path.exists():
+        try:
+            outline = json.loads(outline_path.read_text(encoding="utf-8"))
+        except Exception:
+            outline = None
+    agent = (points or {}).get("智能体")
+    agent_path = OUTPUT_DIR / f"{sid}_智能体.json"
+    if agent_path.exists():
+        try:
+            agent = json.loads(agent_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
     return {
         "sid": sid,
         "filename": idx.get("filename", sess["stem"] + src.suffix),
@@ -960,6 +1027,8 @@ def history_detail(sid: str):
         "critical": critical,
         "score": max(0, 100 - risk_total) if isinstance(risk_total, int) else None,
         "points": points,
+        "outline": outline,
+        "agent": agent,
         "review": review_data,
         "dq_check": dq_check,
         "review_report": (OUTPUT_DIR / f"{sid}_审标报告.md").read_text(encoding="utf-8")

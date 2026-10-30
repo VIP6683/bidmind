@@ -1,20 +1,37 @@
 <script setup>
-import { ref, computed } from 'vue';
+import { ref, computed, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { ElMessage } from 'element-plus';
 import { useAnalysisStore } from '../store/analysis';
-import { uploadFile } from '../api';
+import { getLlmConfig } from '../api';
 
 const router = useRouter();
 const store = useAnalysisStore();
 
 const uploading = ref(false);
 const uploadRef = ref();
+const hasLlmKey = ref(false);
+
+onMounted(async () => {
+	try {
+		const c = await getLlmConfig();
+		hasLlmKey.value = !!c.has_key;
+	} catch {
+		hasLlmKey.value = false;
+	}
+});
 
 const done = computed(() => store.steps.every((s) => s.status === 'success'));
 
 const ocrPages = computed(() => store.result?.points?.summary?.OCR页数 ?? 0);
 const totalPages = computed(() => store.result?.points?.summary?.总页数 ?? 0);
+const agentWarning = computed(
+	() => store.result?.points?.agent?.warning || store.result?.points?.points?.智能体?.warning || ''
+);
+const outlineChapters = computed(
+	() => store.result?.points?.outline?.chapters || store.result?.points?.summary?.大纲章节 || 0
+);
+const agentMode = computed(() => store.result?.points?.agent?.mode);
 
 async function onFile(file) {
 	const f = file.raw || file;
@@ -43,6 +60,14 @@ function onChange(file) {
 			element-loading-text="正在处理，请稍候…"
 		>
 			<div class="panel-title">新建分析</div>
+			<el-alert
+				v-if="!hasLlmKey && !store.sid"
+				title="尚未配置 AI Key：仍可分析，但大纲主要靠本地规则，偏差会较大。请先到「AI模型配置」填写后重新上传。"
+				type="warning"
+				show-icon
+				:closable="false"
+				style="margin-bottom: 16px"
+			/>
 
 			<!-- 上传区 -->
 			<el-upload
@@ -62,7 +87,8 @@ function onChange(file) {
 						支持 PDF / Word(docx) / Markdown / TXT，单文件最大 50MB
 					</div>
 					<div class="text-muted" style="margin-top: 4px">
-						上传后将自动执行：要点解析 → 风险扫描 → 生成投标初稿
+						上传后智能体自动执行：本地规则抽取 + 模型起草大纲（规则验收缺口会回修）→
+						风险扫描 → 初稿骨架
 					</div>
 				</div>
 			</el-upload>
@@ -98,6 +124,14 @@ function onChange(file) {
 					:closable="false"
 					style="margin: 18px 0"
 				/>
+				<el-alert
+					v-if="agentWarning"
+					:title="agentWarning"
+					type="warning"
+					show-icon
+					:closable="false"
+					style="margin: 18px 0"
+				/>
 
 				<el-alert
 					v-if="ocrPages > 0"
@@ -128,9 +162,13 @@ function onChange(file) {
 							<div class="sum-num orange">{{ store.result.review?.total ?? 0 }}</div>
 						</div>
 						<div class="panel sum">
-							<div class="stat-label">初稿章节</div>
-							<div class="sum-num green">
-								{{ store.result.generate?.sections ?? 0 }}
+							<div class="stat-label">大纲章节</div>
+							<div class="sum-num green">{{ outlineChapters }}</div>
+						</div>
+						<div class="panel sum">
+							<div class="stat-label">智能体</div>
+							<div class="sum-num" style="font-size: 16px; padding-top: 8px">
+								{{ agentMode === 'hybrid' ? '模型+规则' : '仅规则' }}
 							</div>
 						</div>
 					</div>
@@ -199,7 +237,7 @@ function onChange(file) {
 
 .summary-grid {
 	display: grid;
-	grid-template-columns: repeat(4, 1fr);
+	grid-template-columns: repeat(5, 1fr);
 	gap: 12px;
 	margin-top: 6px;
 }
@@ -230,5 +268,11 @@ function onChange(file) {
 	display: flex;
 	justify-content: center;
 	gap: 10px;
+}
+
+@media (max-width: 1100px) {
+	.summary-grid {
+		grid-template-columns: repeat(2, 1fr);
+	}
 }
 </style>
